@@ -1,0 +1,2 @@
+[console_scripts]
+euv-acquisition-sim = euv_acquisition.simulator_service:main

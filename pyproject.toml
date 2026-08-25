@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ipi-euv-acquisition"
+version = "0.1.2"
+description = "Pulse-resolved EUV acquisition service"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=2.0",
+]
+
+[project.optional-dependencies]
+storage = ["h5py>=3.11"]
+simulator-dds = ["ipi-ecs>=0.1.0"]
+dev = [
+  "h5py>=3.11",
+  "pytest>=8",
+]
+
+[project.scripts]
+euv-acquisition-sim = "euv_acquisition.simulator_service:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

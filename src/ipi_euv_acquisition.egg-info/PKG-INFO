@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: ipi-euv-acquisition
+Version: 0.1.2
+Summary: Pulse-resolved EUV acquisition service
+Requires-Python: >=3.10
+Requires-Dist: numpy>=2.0
+Provides-Extra: storage
+Requires-Dist: h5py>=3.11; extra == "storage"
+Provides-Extra: simulator-dds
+Requires-Dist: ipi-ecs>=0.1.0; extra == "simulator-dds"
+Provides-Extra: dev
+Requires-Dist: h5py>=3.11; extra == "dev"
+Requires-Dist: pytest>=8; extra == "dev"
