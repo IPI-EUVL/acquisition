@@ -18,6 +18,15 @@ def test_timing_state_round_trips_and_separates_triggering_from_transmission() -
     assert open_state.euv_transmitting() is True
 
 
+def test_stopped_chopper_zero_frequency_is_valid_but_disables_triggers() -> None:
+    stopped = _state(frequency=0.0)
+
+    assert LaserTimingState.decode(stopped.encode()) == stopped
+    assert stopped.triggers_enabled is False
+    assert stopped.euv_transmitting() is False
+    assert stopped.trigger_rate_hz is None
+
+
 def test_timing_state_round_trips_producer_timestamps_and_decodes_v1() -> None:
     timestamped = LaserTimingState(True, False, True, False, 10.0, 0.0, 10.0, 192.0, 12, 34)
     legacy_payload = {

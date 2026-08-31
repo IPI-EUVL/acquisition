@@ -31,8 +31,8 @@ class LaserTimingState:
                 raise ValueError(f"{name} must be finite.")
         if self.chopper_frequency_hz is not None:
             value = self.chopper_frequency_hz
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value <= 0:
-                raise ValueError("chopper_frequency_hz must be positive and finite when present.")
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
+                raise ValueError("chopper_frequency_hz must be non-negative and finite when present.")
         for name in ("sampled_at_unix_ns", "sampled_at_monotonic_ns"):
             value = getattr(self, name)
             if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
@@ -46,6 +46,7 @@ class LaserTimingState:
             and not self.laser_warming_up
             and not self.chopper_starting_up
             and self.chopper_frequency_hz is not None
+            and self.chopper_frequency_hz > 0
         )
 
     def euv_transmitting(self, phase_epsilon: float = 1e-2) -> bool:
