@@ -7,6 +7,7 @@ import numpy as np
 from euv_acquisition.models import CaptureConfig, CapturedPulse
 from euv_acquisition.service import AcquisitionClient, AcquisitionServer, ServiceConfig
 from euv_acquisition.session import CaptureEngine, RotationConfig, SpoolRepository
+from euv_acquisition.simulator_controls import SimulatorFaultControls
 from euv_acquisition.snapshot import SnapshotStore
 
 
@@ -37,7 +38,7 @@ class QueuePulseSource:
         self._open = False
 
 
-def _server(tmp_path, *, timestamps=(1, 2), watchdog=5.0, logger=None):
+def _server(tmp_path, *, timestamps=(1, 2), watchdog=5.0, logger=None, simulator_controls=None):
     source = QueuePulseSource(timestamps)
     store = SnapshotStore(tmp_path / "spool")
     spool = SpoolRepository(tmp_path / "spool", server_boot_id=uuid4())
@@ -53,6 +54,7 @@ def _server(tmp_path, *, timestamps=(1, 2), watchdog=5.0, logger=None):
         engine,
         ServiceConfig(control_port=0, artifact_port=0, capture_poll_seconds=0.001, controller_watchdog_seconds=watchdog),
         logger=logger,
+        simulator_controls=simulator_controls,
     )
     server.start()
     return server
@@ -150,3 +152,84 @@ def test_service_logs_control_command_lifecycle(tmp_path) -> None:
     assert "capture_started" in events
     assert "capture_stopped" in events
     assert "control_command_completed" in events
+
+
+def test_service_reports_capabilities_and_defaults_capture_to_experiment(tmp_path) -> None:
+    server = _server(tmp_path, timestamps=())
+    client = AcquisitionClient(server.control_address, server.artifact_address)
+    client.connect()
+    try:
+        status = client.command("status")
+        started = client.command("start_capture", {"session_id": str(uuid4())})
+
+        assert status["source_kind"] == "simulated"
+        assert status["source_id"] == "test"
+        assert status["capabilities"] == {
+            "capture_purpose": True,
+            "purge_snapshot": True,
+            "discard_diagnostic_session": True,
+            "simulator_controls": False,
+        }
+        assert status["simulator"] is None
+        assert started["session"]["purpose"] == "experiment"
+        client.command("stop_capture")
+    finally:
+        client.close()
+        server.close()
+
+
+def test_service_purges_and_discards_diagnostic_artifacts(tmp_path) -> None:
+    server = _server(tmp_path, timestamps=(1,))
+    client = AcquisitionClient(server.control_address, server.artifact_address)
+    client.connect()
+    try:
+        session_id = uuid4()
+        client.command("start_capture", {"session_id": str(session_id), "purpose": "diagnostic"})
+        client.get_report(timeout=1.0)
+        client.command("flush_snapshot")
+        snapshot = client.get_snapshot(timeout=1.0)
+        client.fetch_snapshot(snapshot.snapshot_id, tmp_path / "received")
+        client.command("acknowledge_snapshot", {"snapshot_id": str(snapshot.snapshot_id)})
+        client.command("purge_snapshot", {"snapshot_id": str(snapshot.snapshot_id)})
+        client.command("stop_capture", {"reason": "diagnostic complete"})
+        discarded = client.command("discard_diagnostic_session", {"session_id": str(session_id)})
+
+        assert discarded["discarded"] is True
+        assert server.engine.spool.load() is None
+        assert not server.engine.snapshot_store.path_for(snapshot).exists()
+    finally:
+        client.close()
+        server.close()
+
+
+def test_service_routes_controls_only_to_simulator_provider(tmp_path) -> None:
+    controls = SimulatorFaultControls()
+    server = _server(tmp_path / "simulator", timestamps=(), simulator_controls=controls)
+    client = AcquisitionClient(server.control_address, server.artifact_address)
+    client.connect()
+    try:
+        status = client.command("status")
+        changed = client.command("set_simulator_control", {"name": "pll_locked", "enabled": False})
+        restored = client.command("restore_simulator_controls")
+
+        assert status["capabilities"]["simulator_controls"] is True
+        assert changed["simulator"]["pll_locked"] is False
+        assert changed["simulator"]["effective_euv_transmitting"] is False
+        assert restored["simulator"]["pll_locked"] is True
+        with __import__("pytest").raises(RuntimeError, match="Unknown simulator control"):
+            client.command("set_simulator_control", {"name": "physical_laser", "enabled": True})
+        with __import__("pytest").raises(RuntimeError, match="boolean"):
+            client.command("set_simulator_control", {"name": "pll_locked", "enabled": 1})
+    finally:
+        client.close()
+        server.close()
+
+    hardware = _server(tmp_path / "hardware", timestamps=())
+    hardware_client = AcquisitionClient(hardware.control_address, hardware.artifact_address)
+    hardware_client.connect()
+    try:
+        with __import__("pytest").raises(RuntimeError, match="not available"):
+            hardware_client.command("set_simulator_control", {"name": "pll_locked", "enabled": False})
+    finally:
+        hardware_client.close()
+        hardware.close()

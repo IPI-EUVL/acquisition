@@ -22,12 +22,20 @@ from euv_acquisition.protocol import (
     validate_command_message,
     validate_response_message,
 )
-from euv_acquisition.session import CaptureEngine, CaptureSessionManifest, CaptureSessionState
+from euv_acquisition.session import CaptureEngine, CapturePurpose, CaptureSessionManifest, CaptureSessionState
 from euv_acquisition.snapshot import SnapshotManifest
 
 
 class ServiceLogger(Protocol):
     def log(self, message: str, **kwargs: Any) -> None: ...
+
+
+class SimulatorControlProvider(Protocol):
+    def set_control(self, name: str, enabled: bool) -> None: ...
+
+    def restore_nominal(self) -> None: ...
+
+    def status_value(self) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -56,10 +64,12 @@ class AcquisitionServer:
         config: ServiceConfig = ServiceConfig(),
         *,
         logger: ServiceLogger | None = None,
+        simulator_controls: SimulatorControlProvider | None = None,
     ) -> None:
         self.engine = engine
         self.config = config
         self._logger = logger
+        self._simulator_controls = simulator_controls
         self._stop = threading.Event()
         self._control_listener: socket.socket | None = None
         self._artifact_listener: socket.socket | None = None
@@ -304,13 +314,15 @@ class AcquisitionServer:
 
     def _handle_command(self, command: str, payload: dict[str, Any]) -> dict[str, Any]:
         if command == "start_capture":
-            if set(payload) != {"session_id"}:
-                raise ValueError("start_capture requires only session_id.")
-            session_id = self.engine.start(UUID(str(payload["session_id"])))
+            if "session_id" not in payload or set(payload) - {"session_id", "purpose"}:
+                raise ValueError("start_capture requires session_id and accepts optional purpose.")
+            purpose = CapturePurpose(str(payload.get("purpose", CapturePurpose.EXPERIMENT.value)))
+            session_id = self.engine.start(UUID(str(payload["session_id"])), purpose)
             self._log(
-                f"Started capture session {session_id}.",
+                f"Started {purpose.value} capture session {session_id}.",
                 event="capture_started",
                 session_id=str(session_id),
+                purpose=purpose.value,
             )
             return {
                 "session_id": str(session_id),
@@ -355,12 +367,52 @@ class AcquisitionServer:
                 session_id=str(manifest.session_id),
             )
             return {"session_id": str(manifest.session_id), "state": manifest.state.value}
+        if command == "purge_snapshot":
+            if set(payload) != {"snapshot_id"}:
+                raise ValueError("purge_snapshot requires only snapshot_id.")
+            snapshot_id = UUID(str(payload["snapshot_id"]))
+            manifest = self.engine.spool.purge_snapshot(self.engine.snapshot_store, snapshot_id)
+            self._log(
+                f"Purged acknowledged snapshot {snapshot_id} for session {manifest.session_id}.",
+                event="snapshot_purged",
+                snapshot_id=str(snapshot_id),
+                session_id=str(manifest.session_id),
+            )
+            return {"session_id": str(manifest.session_id), "purged": True}
+        if command == "discard_diagnostic_session":
+            if set(payload) != {"session_id"}:
+                raise ValueError("discard_diagnostic_session requires only session_id.")
+            session_id = UUID(str(payload["session_id"]))
+            self.engine.spool.discard_diagnostic(self.engine.snapshot_store, session_id)
+            self._log(
+                f"Discarded diagnostic capture session {session_id}.",
+                event="diagnostic_session_discarded",
+                session_id=str(session_id),
+            )
+            return {"session_id": str(session_id), "discarded": True}
         if command == "release_snapshots":
             if payload:
                 raise ValueError("release_snapshots does not accept payload fields.")
             self.engine.spool.release(self.engine.snapshot_store)
             self._log("Released acknowledged capture artifacts from the spool.", event="capture_artifacts_released")
             return {"released": True}
+        if command == "set_simulator_control":
+            if set(payload) != {"name", "enabled"}:
+                raise ValueError("set_simulator_control requires only name and enabled.")
+            if self._simulator_controls is None:
+                raise RuntimeError("Simulator controls are not available for this acquisition source.")
+            enabled = payload["enabled"]
+            if not isinstance(enabled, bool):
+                raise ValueError("Simulator control enabled value must be boolean.")
+            self._simulator_controls.set_control(str(payload["name"]), enabled)
+            return {"simulator": self._simulator_controls.status_value()}
+        if command == "restore_simulator_controls":
+            if payload:
+                raise ValueError("restore_simulator_controls does not accept payload fields.")
+            if self._simulator_controls is None:
+                raise RuntimeError("Simulator controls are not available for this acquisition source.")
+            self._simulator_controls.restore_nominal()
+            return {"simulator": self._simulator_controls.status_value()}
         raise ValueError(f"Unknown acquisition command {command!r}.")
 
     def _find_snapshot(self, snapshot_id: UUID) -> SnapshotManifest:
@@ -376,6 +428,15 @@ class AcquisitionServer:
         session = self.engine.spool.load()
         return {
             "server_boot_id": str(self.engine.spool.server_boot_id),
+            "source_kind": self.engine.source_kind,
+            "source_id": self.engine.source_id,
+            "capabilities": {
+                "capture_purpose": True,
+                "purge_snapshot": True,
+                "discard_diagnostic_session": True,
+                "simulator_controls": self._simulator_controls is not None,
+            },
+            "simulator": None if self._simulator_controls is None else self._simulator_controls.status_value(),
             "capture_active": self.engine.active,
             "session": None if session is None else session.to_dict(),
         }

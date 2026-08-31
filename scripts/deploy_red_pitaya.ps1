@@ -249,6 +249,7 @@ import rp
 import _rp_py
 import segment_bytes
 from euv_acquisition import red_pitaya_service
+from euv_acquisition.simulator_controls import SimulatorFaultControls
 from ipi_ecs.core.tcp import TCPClientSocket
 from ipi_ecs.dds.client import DDSClient
 from ipi_ecs.logging.client import LogClient
@@ -261,6 +262,7 @@ assert pathlib.Path(rp.__file__).resolve().is_relative_to("/opt/redpitaya/lib/py
 assert pathlib.Path(_rp_py.__file__).resolve().is_relative_to("/opt/redpitaya/lib/python")
 assert pathlib.Path(segment_bytes.__file__).resolve().is_relative_to(release_python_root)
 assert red_pitaya_service._parse_args(["--spool", "/tmp/euv-acquisition-preflight"]).spool == "/tmp/euv-acquisition-preflight"
+assert SimulatorFaultControls().status_value()["pll_locked"] is True
 assert TCPClientSocket is not None
 assert DDSClient is not None
 assert LogClient is not None

@@ -16,6 +16,10 @@ The simulator opens a small control window by default. Use it to turn the simula
 
 The simulator follows the chamber's versioned laser timing state by default and fails closed before the first timing update. It uses `ECS_HOST` or `127.0.0.1` for DDS, and defaults to the chamber Laser Sync Controller UUID. `--dds-host` and `--laser-subsystem-uuid` override those values. Use `--standalone-timing` only for isolated simulator tests that should continuously model a nominal transmitting laser. Manual controls remain fault-injection overrides in either mode.
 
+When the simulator runs headless on the Red Pitaya, chamber control can operate its laser, chopper, and PLL fault gates through the acquisition controller's DDS interface. The simulator advertises this capability in acquisition status; the hardware service does not, so simulator-control commands fail closed against the physical ADC source.
+
+Capture sessions are tagged as `experiment` or `diagnostic`. Experiment artifacts retain the existing acknowledge-then-release lifecycle. Diagnostic clients may purge each verified, acknowledged snapshot immediately and may discard only a stopped diagnostic session; these commands reject experiment sessions so test cleanup cannot remove exposure data.
+
 The Red Pitaya adapter is isolated in `euv_acquisition.sources.red_pitaya`; it is tested with a fake API locally and must be validated against the STEMlab hardware before authoritative use.
 
 ## Red Pitaya service

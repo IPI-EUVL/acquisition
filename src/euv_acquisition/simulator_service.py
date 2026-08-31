@@ -102,6 +102,7 @@ def main() -> int:
         engine,
         ServiceConfig(host=args.host, control_port=args.control_port, artifact_port=args.artifact_port),
         logger=logger,
+        simulator_controls=controls,
     )
     stop_event = threading.Event()
     signal.signal(signal.SIGINT, lambda _signum, _frame: stop_event.set())

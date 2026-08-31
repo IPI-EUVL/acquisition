@@ -18,7 +18,7 @@ from euv_acquisition.snapshot import SNAPSHOT_SCHEMA_VERSION, SnapshotManifest, 
 from euv_acquisition.sources.base import PulseSource
 
 
-SESSION_SCHEMA_VERSION = 1
+SESSION_SCHEMA_VERSION = 2
 SESSION_MANIFEST_FILENAME = "capture_session.json"
 MANIFEST_REPLACE_ATTEMPTS = 5
 MANIFEST_REPLACE_DELAY_SECONDS = 0.05
@@ -28,6 +28,11 @@ class CaptureSessionState(str, Enum):
     ACTIVE = "active"
     STOPPED = "stopped"
     ORPHANED = "orphaned"
+
+
+class CapturePurpose(str, Enum):
+    EXPERIMENT = "experiment"
+    DIAGNOSTIC = "diagnostic"
 
 
 @dataclass(frozen=True)
@@ -55,6 +60,7 @@ class CaptureSessionManifest:
     source_kind: str
     source_id: str
     started_at_unix_ns: int
+    purpose: CapturePurpose = CapturePurpose.EXPERIMENT
     snapshots: tuple[StoredSnapshot, ...] = ()
     final_sequence: int | None = None
     stop_reason: str | None = None
@@ -69,6 +75,7 @@ class CaptureSessionManifest:
             "source_kind": self.source_kind,
             "source_id": self.source_id,
             "started_at_unix_ns": self.started_at_unix_ns,
+            "purpose": self.purpose.value,
             "snapshots": [snapshot.to_dict() for snapshot in self.snapshots],
             "final_sequence": self.final_sequence,
             "stop_reason": self.stop_reason,
@@ -89,10 +96,15 @@ class CaptureSessionManifest:
             "final_sequence",
             "stop_reason",
         }
-        if not isinstance(value, dict) or set(value) != expected:
+        if not isinstance(value, dict):
             raise ValueError("Capture session manifest contains unknown or missing fields.")
-        if value["schema_version"] != SESSION_SCHEMA_VERSION:
+        schema_version = value.get("schema_version")
+        if schema_version == SESSION_SCHEMA_VERSION:
+            expected.add("purpose")
+        elif schema_version != 1:
             raise ValueError("Unsupported capture session schema version.")
+        if set(value) != expected:
+            raise ValueError("Capture session manifest contains unknown or missing fields.")
         if value["snapshot_schema_version"] != SNAPSHOT_SCHEMA_VERSION:
             raise ValueError("Unsupported capture-session snapshot schema version.")
         if not isinstance(value["snapshots"], list):
@@ -105,6 +117,7 @@ class CaptureSessionManifest:
             source_kind=str(value["source_kind"]),
             source_id=str(value["source_id"]),
             started_at_unix_ns=int(value["started_at_unix_ns"]),
+            purpose=CapturePurpose(value.get("purpose", CapturePurpose.EXPERIMENT.value)),
             snapshots=tuple(StoredSnapshot.from_dict(item) for item in value["snapshots"]),
             final_sequence=None if final_sequence is None else int(final_sequence),
             stop_reason=None if value["stop_reason"] is None else str(value["stop_reason"]),
@@ -162,7 +175,14 @@ class SpoolRepository:
                 temporary.unlink(missing_ok=True)
             return manifest
 
-    def begin(self, session_id: UUID, source_kind: str, source_id: str, started_at_unix_ns: int) -> CaptureSessionManifest:
+    def begin(
+        self,
+        session_id: UUID,
+        source_kind: str,
+        source_id: str,
+        started_at_unix_ns: int,
+        purpose: CapturePurpose = CapturePurpose.EXPERIMENT,
+    ) -> CaptureSessionManifest:
         with self._lock:
             if self.load() is not None:
                 raise RuntimeError("Cannot start capture while an unreleased session remains in the spool.")
@@ -174,6 +194,7 @@ class SpoolRepository:
                     source_kind=source_kind,
                     source_id=source_id,
                     started_at_unix_ns=started_at_unix_ns,
+                    purpose=CapturePurpose(purpose),
                 )
             )
 
@@ -201,6 +222,17 @@ class SpoolRepository:
             if not found:
                 raise ValueError(f"Snapshot {snapshot_id} is not in the current session.")
             return self._write(replace(current, snapshots=tuple(snapshots)))
+
+    def purge_snapshot(self, snapshot_store: SnapshotStore, snapshot_id: UUID) -> CaptureSessionManifest:
+        with self._lock:
+            current = self._require()
+            stored = next((item for item in current.snapshots if item.manifest.snapshot_id == snapshot_id), None)
+            if stored is None:
+                raise ValueError(f"Snapshot {snapshot_id} is not in the current session.")
+            if not stored.acknowledged:
+                raise RuntimeError("Cannot purge an unacknowledged snapshot.")
+            snapshot_store.path_for(stored.manifest).unlink(missing_ok=True)
+            return current
 
     def stop(self, final_sequence: int | None, reason: str) -> CaptureSessionManifest:
         with self._lock:
@@ -241,6 +273,19 @@ class SpoolRepository:
             unacknowledged = [item.manifest.snapshot_id for item in current.snapshots if not item.acknowledged]
             if unacknowledged:
                 raise RuntimeError(f"Cannot release session with {len(unacknowledged)} unacknowledged snapshot(s).")
+            for item in current.snapshots:
+                snapshot_store.path_for(item.manifest).unlink(missing_ok=True)
+            self.manifest_path.unlink()
+
+    def discard_diagnostic(self, snapshot_store: SnapshotStore, session_id: UUID) -> None:
+        with self._lock:
+            current = self._require()
+            if current.session_id != session_id:
+                raise ValueError("Diagnostic session ID does not match the retained session.")
+            if current.purpose is not CapturePurpose.DIAGNOSTIC:
+                raise RuntimeError("Cannot discard an experiment capture session.")
+            if current.state is CaptureSessionState.ACTIVE:
+                raise RuntimeError("Cannot discard an active diagnostic session.")
             for item in current.snapshots:
                 snapshot_store.path_for(item.manifest).unlink(missing_ok=True)
             self.manifest_path.unlink()
@@ -318,12 +363,22 @@ class CaptureEngine:
         with self._lock:
             return self._session_id
 
-    def start(self, session_id: UUID | None = None) -> UUID:
+    def start(
+        self,
+        session_id: UUID | None = None,
+        purpose: CapturePurpose = CapturePurpose.EXPERIMENT,
+    ) -> UUID:
         with self._lock:
             if self._active:
                 raise RuntimeError("Capture is already active.")
             selected_id = session_id or uuid4()
-            self.spool.begin(selected_id, self.source_kind, self.source_id, self._unix_time_ns())
+            self.spool.begin(
+                selected_id,
+                self.source_kind,
+                self.source_id,
+                self._unix_time_ns(),
+                CapturePurpose(purpose),
+            )
             try:
                 self.source.open()
             except Exception:

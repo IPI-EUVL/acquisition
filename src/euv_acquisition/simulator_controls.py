@@ -47,6 +47,20 @@ class SimulatorFaultControls:
         with self._lock:
             self._pll_locked = bool(locked)
 
+    def set_control(self, name: str, enabled: bool) -> None:
+        setters = {
+            "laser_enabled": self.set_laser_enabled,
+            "chopper_enabled": self.set_chopper_enabled,
+            "pll_locked": self.set_pll_locked,
+        }
+        try:
+            setter = setters[name]
+        except KeyError as exc:
+            raise ValueError(f"Unknown simulator control {name!r}.") from exc
+        if not isinstance(enabled, bool):
+            raise ValueError("Simulator control value must be boolean.")
+        setter(enabled)
+
     def restore_nominal(self) -> None:
         with self._lock:
             self._laser_enabled = True
@@ -87,3 +101,16 @@ class SimulatorFaultControls:
             ),
             trigger_rate_hz=trigger_rate_hz,
         )
+
+    def status_value(self) -> dict[str, bool | float | None]:
+        status = self.status()
+        return {
+            "upstream_triggers_enabled": status.upstream_triggers_enabled,
+            "upstream_euv_transmitting": status.upstream_euv_transmitting,
+            "laser_enabled": status.laser_enabled,
+            "chopper_enabled": status.chopper_enabled,
+            "pll_locked": status.pll_locked,
+            "effective_triggers_enabled": status.effective_triggers_enabled,
+            "effective_euv_transmitting": status.effective_euv_transmitting,
+            "trigger_rate_hz": status.trigger_rate_hz,
+        }

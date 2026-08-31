@@ -10,6 +10,8 @@ import pytest
 from euv_acquisition.models import CaptureConfig, CapturedPulse, SnapshotCloseReason
 from euv_acquisition.session import (
     CaptureEngine,
+    CapturePurpose,
+    CaptureSessionManifest,
     CaptureSessionState,
     RotationConfig,
     SpoolRepository,
@@ -122,6 +124,55 @@ def test_spool_requires_acknowledged_terminal_session_before_release(tmp_path) -
 
     assert spool.load() is None
     assert list(tmp_path.glob("snap_*.h5")) == []
+
+
+def test_schema_one_session_defaults_to_experiment_purpose(tmp_path) -> None:
+    spool = SpoolRepository(tmp_path, server_boot_id=uuid4())
+    legacy = spool.begin(uuid4(), "simulated", "legacy", 1).to_dict()
+    legacy["schema_version"] = 1
+    legacy.pop("purpose")
+
+    decoded = CaptureSessionManifest.from_dict(legacy)
+
+    assert decoded.purpose is CapturePurpose.EXPERIMENT
+
+
+def test_spool_purges_only_acknowledged_snapshot_data(tmp_path) -> None:
+    engine, store, spool = _engine(tmp_path, timestamps=(1,))
+    engine.start(purpose=CapturePurpose.DIAGNOSTIC)
+    engine.capture_once()
+    snapshot = engine.flush().closed_snapshots[0]
+
+    with pytest.raises(RuntimeError, match="unacknowledged"):
+        spool.purge_snapshot(store, snapshot.snapshot_id)
+    spool.acknowledge(snapshot.snapshot_id)
+    retained = spool.purge_snapshot(store, snapshot.snapshot_id)
+
+    assert retained.snapshots[0].acknowledged is True
+    assert not store.path_for(snapshot).exists()
+    assert spool.load() is not None
+
+
+def test_spool_discards_only_terminal_diagnostic_sessions(tmp_path) -> None:
+    engine, store, spool = _engine(tmp_path / "diagnostic", timestamps=(1,))
+    session_id = engine.start(purpose=CapturePurpose.DIAGNOSTIC)
+    with pytest.raises(RuntimeError, match="active diagnostic"):
+        spool.discard_diagnostic(store, session_id)
+    engine.capture_once()
+    snapshot = engine.stop().closed_snapshots[0]
+
+    spool.discard_diagnostic(store, session_id)
+
+    assert spool.load() is None
+    assert not store.path_for(snapshot).exists()
+
+    experiment, experiment_store, experiment_spool = _engine(tmp_path / "experiment", timestamps=())
+    experiment_id = experiment.start()
+    with pytest.raises(RuntimeError, match="experiment"):
+        experiment_spool.discard_diagnostic(experiment_store, experiment_id)
+    experiment.stop()
+    with pytest.raises(RuntimeError, match="experiment"):
+        experiment_spool.discard_diagnostic(experiment_store, experiment_id)
 
 
 def test_restart_marks_active_spool_session_orphaned(tmp_path) -> None:
