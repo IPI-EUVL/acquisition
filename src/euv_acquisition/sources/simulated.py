@@ -92,7 +92,7 @@ class SimulatedPulseSource:
             self._next_trigger_monotonic_ns = now
         if now < self._next_trigger_monotonic_ns:
             return None
-        interval_ns = int(round(125e6 / trigger_rate_hz))
+        interval_ns = int(round(1e9 / trigger_rate_hz))
         self._next_trigger_monotonic_ns += interval_ns
         while self._next_trigger_monotonic_ns <= now:
             self._next_trigger_monotonic_ns += interval_ns
