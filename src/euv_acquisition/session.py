@@ -13,7 +13,8 @@ from typing import Callable
 from uuid import UUID, uuid4
 
 from euv_acquisition.analysis import analyze_pulse
-from euv_acquisition.models import PulseQuality, PulseRecord, PulseReport, SnapshotCloseReason
+from euv_acquisition.models import CapturedPulse, PulseQuality, PulseRecord, PulseReport, SnapshotCloseReason
+from euv_acquisition.pipeline_metrics import PipelineMetrics
 from euv_acquisition.snapshot import SNAPSHOT_SCHEMA_VERSION, SnapshotManifest, SnapshotStore
 from euv_acquisition.sources.base import PulseSource
 
@@ -325,6 +326,25 @@ class CaptureUpdate:
     stop_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class AcceptedPulse:
+    sequence: int
+    pulse: CapturedPulse
+
+
+@dataclass(frozen=True)
+class SnapshotBatch:
+    records: tuple[PulseRecord, ...]
+    close_reason: SnapshotCloseReason
+
+
+@dataclass(frozen=True)
+class PulseProcessingResult:
+    report: PulseReport
+    closed_batches: tuple[SnapshotBatch, ...] = ()
+    stop_reason: str | None = None
+
+
 class CaptureEngine:
     def __init__(
         self,
@@ -337,6 +357,7 @@ class CaptureEngine:
         rotation: RotationConfig = RotationConfig(),
         unix_time_ns: Callable[[], int] = time.time_ns,
         monotonic_time_ns: Callable[[], int] = time.monotonic_ns,
+        metrics: PipelineMetrics | None = None,
     ) -> None:
         self.source = source
         self.snapshot_store = snapshot_store
@@ -346,10 +367,17 @@ class CaptureEngine:
         self.rotation = rotation
         self._unix_time_ns = unix_time_ns
         self._monotonic_time_ns = monotonic_time_ns
+        source_metrics = getattr(source, "_metrics", None)
+        self.metrics = metrics or source_metrics or PipelineMetrics()
+        set_metrics = getattr(source, "set_metrics", None)
+        if set_metrics is not None:
+            set_metrics(self.metrics)
         self._session_id: UUID | None = None
         self._next_sequence = 0
+        self._next_analysis_sequence = 0
         self._pending: list[PulseRecord] = []
         self._clipping_window: deque[bool] = deque(maxlen=rotation.clipped_pulse_window)
+        self._terminal_requested = False
         self._active = False
         self._lock = threading.RLock()
 
@@ -369,27 +397,134 @@ class CaptureEngine:
         purpose: CapturePurpose = CapturePurpose.EXPERIMENT,
     ) -> UUID:
         with self._lock:
-            if self._active:
-                raise RuntimeError("Capture is already active.")
-            selected_id = session_id or uuid4()
-            self.spool.begin(
-                selected_id,
-                self.source_kind,
-                self.source_id,
-                self._unix_time_ns(),
-                CapturePurpose(purpose),
-            )
+            selected_id = self._begin_session_locked(session_id, purpose)
             try:
                 self.source.open()
-            except Exception:
+            except Exception as exc:
                 self.spool.stop(None, "Pulse source failed to open.")
+                self.metrics.finish(terminal_error=f"Pulse source failed to open: {type(exc).__name__}: {exc}")
+                self._active = False
                 raise
-            self._session_id = selected_id
-            self._next_sequence = 0
-            self._pending.clear()
-            self._clipping_window.clear()
-            self._active = True
+            self.refresh_capture_mode()
             return selected_id
+
+    def begin_session(
+        self,
+        session_id: UUID | None = None,
+        purpose: CapturePurpose = CapturePurpose.EXPERIMENT,
+    ) -> UUID:
+        with self._lock:
+            return self._begin_session_locked(session_id, purpose)
+
+    def refresh_capture_mode(self) -> None:
+        requested = str(
+            getattr(
+                self.source,
+                "requested_capture_mode",
+                getattr(self.source, "capture_mode", self.source_kind),
+            )
+        )
+        effective = str(getattr(self.source, "effective_capture_mode", requested))
+        fallback_reason = getattr(self.source, "capture_fallback_reason", None)
+        self.metrics.set_capture_mode(
+            requested_mode=requested,
+            effective_mode=effective,
+            fallback_reason=fallback_reason,
+        )
+
+    def accept_pulse(self, pulse: CapturedPulse) -> AcceptedPulse:
+        with self._lock:
+            self._require_active()
+            if len(pulse.samples_v) != self.source.capture_config.window_samples:
+                raise ValueError("Pulse source returned the wrong sample count.")
+            owned_pulse = CapturedPulse(
+                samples_v=pulse.samples_v.copy(),
+                captured_at_unix_ns=pulse.captured_at_unix_ns,
+                captured_at_monotonic_ns=pulse.captured_at_monotonic_ns,
+            )
+            accepted = AcceptedPulse(self._next_sequence, owned_pulse)
+            self._next_sequence += 1
+            self.metrics.increment("accepted")
+            return accepted
+
+    def process_accepted(self, accepted: AcceptedPulse) -> PulseProcessingResult:
+        with self._lock:
+            self._require_active()
+            if accepted.sequence != self._next_analysis_sequence:
+                raise ValueError(
+                    f"Expected accepted pulse sequence {self._next_analysis_sequence}, got {accepted.sequence}."
+                )
+            analysis_started_ns = self._monotonic_time_ns()
+            analysis = analyze_pulse(accepted.pulse.samples_v, self.source.capture_config)
+            self.metrics.record_duration("analysis", self._monotonic_time_ns() - analysis_started_ns)
+            self.metrics.increment("analyzed")
+            record = PulseRecord(self._session_id, accepted.sequence, accepted.pulse, analysis)
+            self._next_analysis_sequence += 1
+            self._pending.append(record)
+            self._clipping_window.append(bool(analysis.quality & PulseQuality.CLIPPED))
+            closed: list[SnapshotBatch] = []
+
+            if not self._terminal_requested and len(self._pending) >= self.rotation.pulse_limit:
+                closed.append(self._take_batch_locked(SnapshotCloseReason.PULSE_LIMIT))
+
+            stop_reason = None
+            if not self._terminal_requested and sum(self._clipping_window) >= self.rotation.clipped_pulse_limit:
+                self._terminal_requested = True
+                if self._pending:
+                    closed.append(self._take_batch_locked(SnapshotCloseReason.ACQUISITION_ERROR))
+                stop_reason = (
+                    f"Clipping limit reached: {sum(self._clipping_window)} clipped pulse(s) "
+                    f"in the last {len(self._clipping_window)} pulse(s)."
+                )
+
+            return PulseProcessingResult(PulseReport.from_record(record), tuple(closed), stop_reason)
+
+    def take_due_batch(self, now_monotonic_ns: int | None = None) -> SnapshotBatch | None:
+        with self._lock:
+            self._require_active()
+            if not self._pending or self._terminal_requested:
+                return None
+            now = self._monotonic_time_ns() if now_monotonic_ns is None else now_monotonic_ns
+            first = self._pending[0].pulse.captured_at_monotonic_ns
+            last = self._pending[-1].pulse.captured_at_monotonic_ns
+            if now - first >= int(self.rotation.wall_time_seconds * 1e9):
+                return self._take_batch_locked(SnapshotCloseReason.WALL_TIME)
+            if now - last >= int(self.rotation.trigger_idle_seconds * 1e9):
+                return self._take_batch_locked(SnapshotCloseReason.TRIGGER_IDLE)
+            return None
+
+    def take_pending_batch(self, close_reason: SnapshotCloseReason) -> SnapshotBatch | None:
+        with self._lock:
+            self._require_active()
+            return self._take_batch_locked(close_reason) if self._pending else None
+
+    def request_terminal(self) -> None:
+        with self._lock:
+            self._require_active()
+            self._terminal_requested = True
+
+    def persist_batch(self, batch: SnapshotBatch) -> SnapshotManifest:
+        started_ns = self._monotonic_time_ns()
+        manifest = self.snapshot_store.write(
+            batch.records,
+            self.source.capture_config,
+            batch.close_reason,
+            source_kind=self.source_kind,
+            source_id=self.source_id,
+        )
+        self.spool.add_snapshot(manifest)
+        self.metrics.record_duration("snapshot_write", self._monotonic_time_ns() - started_ns)
+        self.metrics.increment("persisted", len(batch.records))
+        self.metrics.increment("snapshots_written")
+        return manifest
+
+    def finalize_session(self, reason: str, *, terminal_error: str | None = None) -> None:
+        with self._lock:
+            self._require_active()
+            final_sequence = self._next_sequence - 1 if self._next_sequence else None
+            self.spool.stop(final_sequence, reason)
+            self._active = False
+            self.metrics.finish(terminal_error=terminal_error)
 
     def capture_once(self) -> CaptureUpdate:
         with self._lock:
@@ -400,58 +535,34 @@ class CaptureEngine:
                 return self._stop_for_error(f"Pulse source failure: {type(exc).__name__}: {exc}")
             if pulse is None:
                 return self.tick()
-            if len(pulse.samples_v) != self.source.capture_config.window_samples:
+            try:
+                accepted = self.accept_pulse(pulse)
+            except ValueError:
                 return self._stop_for_error("Pulse source returned the wrong sample count.")
-
-            analysis = analyze_pulse(pulse.samples_v, self.source.capture_config)
-            record = PulseRecord(self._session_id, self._next_sequence, pulse, analysis)
-            self._next_sequence += 1
-            self._pending.append(record)
-            self._clipping_window.append(bool(analysis.quality & PulseQuality.CLIPPED))
-            report = PulseReport.from_record(record)
-            closed = []
-
-            if len(self._pending) >= self.rotation.pulse_limit:
-                closed.append(self._flush(SnapshotCloseReason.PULSE_LIMIT))
-
-            if sum(self._clipping_window) >= self.rotation.clipped_pulse_limit:
-                if self._pending:
-                    closed.append(self._flush(SnapshotCloseReason.ACQUISITION_ERROR))
-                reason = (
-                    f"Clipping limit reached: {sum(self._clipping_window)} clipped pulse(s) "
-                    f"in the last {len(self._clipping_window)} pulse(s)."
-                )
-                self._finish(reason)
-                return CaptureUpdate(report, tuple(closed), reason)
-
-            return CaptureUpdate(report, tuple(closed))
+            processed = self.process_accepted(accepted)
+            closed = tuple(self.persist_batch(batch) for batch in processed.closed_batches)
+            if processed.stop_reason is not None:
+                self.source.close()
+                self.finalize_session(processed.stop_reason, terminal_error=processed.stop_reason)
+            return CaptureUpdate(processed.report, closed, processed.stop_reason)
 
     def tick(self, now_monotonic_ns: int | None = None) -> CaptureUpdate:
         with self._lock:
-            self._require_active()
-            if not self._pending:
-                return CaptureUpdate()
-            now = self._monotonic_time_ns() if now_monotonic_ns is None else now_monotonic_ns
-            first = self._pending[0].pulse.captured_at_monotonic_ns
-            last = self._pending[-1].pulse.captured_at_monotonic_ns
-            if now - first >= int(self.rotation.wall_time_seconds * 1e9):
-                return CaptureUpdate(closed_snapshots=(self._flush(SnapshotCloseReason.WALL_TIME),))
-            if now - last >= int(self.rotation.trigger_idle_seconds * 1e9):
-                return CaptureUpdate(closed_snapshots=(self._flush(SnapshotCloseReason.TRIGGER_IDLE),))
-            return CaptureUpdate()
+            batch = self.take_due_batch(now_monotonic_ns)
+            return CaptureUpdate() if batch is None else CaptureUpdate(closed_snapshots=(self.persist_batch(batch),))
 
     def flush(self) -> CaptureUpdate:
         with self._lock:
-            self._require_active()
-            if not self._pending:
-                return CaptureUpdate()
-            return CaptureUpdate(closed_snapshots=(self._flush(SnapshotCloseReason.EXPLICIT_FLUSH),))
+            batch = self.take_pending_batch(SnapshotCloseReason.EXPLICIT_FLUSH)
+            return CaptureUpdate() if batch is None else CaptureUpdate(closed_snapshots=(self.persist_batch(batch),))
 
     def stop(self, reason: str = "Capture stop requested.") -> CaptureUpdate:
         with self._lock:
             self._require_active()
-            closed = (self._flush(SnapshotCloseReason.CAPTURE_STOP),) if self._pending else ()
-            self._finish(reason)
+            batch = self.take_pending_batch(SnapshotCloseReason.CAPTURE_STOP)
+            closed = () if batch is None else (self.persist_batch(batch),)
+            self.source.close()
+            self.finalize_session(reason)
             return CaptureUpdate(closed_snapshots=closed, stop_reason=reason)
 
     def abort(self, reason: str) -> CaptureUpdate:
@@ -461,30 +572,62 @@ class CaptureEngine:
                 raise ValueError("Capture abort reason cannot be empty.")
             return self._stop_for_error(reason)
 
+    def abort_if_active(self, reason: str) -> CaptureUpdate | None:
+        with self._lock:
+            if not self._active:
+                return None
+            if not reason.strip():
+                raise ValueError("Capture abort reason cannot be empty.")
+            return self._stop_for_error(reason)
+
     def _stop_for_error(self, reason: str) -> CaptureUpdate:
-        closed = (self._flush(SnapshotCloseReason.ACQUISITION_ERROR),) if self._pending else ()
-        self._finish(reason)
+        batch = self.take_pending_batch(SnapshotCloseReason.ACQUISITION_ERROR)
+        closed = () if batch is None else (self.persist_batch(batch),)
+        self.source.close()
+        self.finalize_session(reason, terminal_error=reason)
         return CaptureUpdate(closed_snapshots=closed, stop_reason=reason)
 
-    def _flush(self, close_reason: SnapshotCloseReason) -> SnapshotManifest:
-        manifest = self.snapshot_store.write(
-            self._pending,
-            self.source.capture_config,
-            close_reason,
-            source_kind=self.source_kind,
-            source_id=self.source_id,
-        )
-        self.spool.add_snapshot(manifest)
+    def _take_batch_locked(self, close_reason: SnapshotCloseReason) -> SnapshotBatch:
+        batch = SnapshotBatch(tuple(self._pending), close_reason)
         self._pending.clear()
-        return manifest
+        return batch
 
-    def _finish(self, reason: str) -> None:
-        try:
-            self.source.close()
-        finally:
-            final_sequence = self._next_sequence - 1 if self._next_sequence else None
-            self.spool.stop(final_sequence, reason)
-            self._active = False
+    def _begin_session_locked(
+        self,
+        session_id: UUID | None,
+        purpose: CapturePurpose,
+    ) -> UUID:
+        if self._active:
+            raise RuntimeError("Capture is already active.")
+        selected_id = session_id or uuid4()
+        self.spool.begin(
+            selected_id,
+            self.source_kind,
+            self.source_id,
+            self._unix_time_ns(),
+            CapturePurpose(purpose),
+        )
+        requested_mode = str(
+            getattr(
+                self.source,
+                "requested_capture_mode",
+                getattr(self.source, "capture_mode", self.source_kind),
+            )
+        )
+        self.metrics.begin_session(
+            selected_id,
+            requested_mode=requested_mode,
+            effective_mode=str(getattr(self.source, "effective_capture_mode", requested_mode)),
+            fallback_reason=getattr(self.source, "capture_fallback_reason", None),
+        )
+        self._session_id = selected_id
+        self._next_sequence = 0
+        self._next_analysis_sequence = 0
+        self._pending.clear()
+        self._clipping_window.clear()
+        self._terminal_requested = False
+        self._active = True
+        return selected_id
 
     def _require_active(self) -> None:
         if not self._active or self._session_id is None:

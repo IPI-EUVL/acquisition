@@ -2,7 +2,8 @@
 param(
     [string]$Target = "euvl-red-pitaya",
     [string]$Python = "python",
-    [switch]$RestartService
+    [switch]$RestartService,
+    [switch]$ConfirmInstrumentIdle
 )
 
 Set-StrictMode -Version Latest
@@ -73,6 +74,9 @@ function Write-Utf8LfLines {
 
 if ($Target -notmatch '^[A-Za-z0-9_.@-]+$') {
     throw "Target must be an SSH host or alias containing only letters, digits, '.', '_', '@', or '-'."
+}
+if ($RestartService -and -not $ConfirmInstrumentIdle) {
+    throw "RestartService requires ConfirmInstrumentIdle after verifying that no exposure or diagnostic capture is active."
 }
 if (-not (Test-Path $serviceUnit -PathType Leaf)) {
     throw "Systemd unit does not exist: $serviceUnit"
@@ -212,6 +216,9 @@ tar -xzf "$archive" -C "$stage"
 cd "$stage"
 printf '%s  %s\n' "$bundle_manifest_sha256" SHA256SUMS | sha256sum --check
 sha256sum --check SHA256SUMS
+grep -Fqx 'Environment="EUV_CAPTURE_MODE=legacy-single-shot"' euv-acquisition.service
+grep -Fq -- '--capture-queue-capacity 32 --persistence-queue-capacity 8 --control-queue-capacity 512 --pipeline-drain-timeout-seconds 10' euv-acquisition.service
+systemd-analyze verify "$stage/euv-acquisition.service"
 
 install -d -m 0755 "$releases_root"
 if [ -e "$release_path" ]; then
@@ -241,6 +248,7 @@ else
     /usr/bin/python3 - <<'PY'
 import os
 import pathlib
+import sys
 import tempfile
 
 import h5py
@@ -255,13 +263,50 @@ from ipi_ecs.dds.client import DDSClient
 from ipi_ecs.logging.client import LogClient
 
 release_python_root = pathlib.Path(os.environ["RELEASE_PYTHON_ROOT"]).resolve()
+assert sys.version_info[:2] == (3, 10), sys.version
 assert np.__version__ == "2.2.5", np.__version__
 assert h5py.__version__ == "3.11.0", h5py.__version__
 assert h5py.version.hdf5_version == "1.10.7", h5py.version.hdf5_version
 assert pathlib.Path(rp.__file__).resolve().is_relative_to("/opt/redpitaya/lib/python")
 assert pathlib.Path(_rp_py.__file__).resolve().is_relative_to("/opt/redpitaya/lib/python")
 assert pathlib.Path(segment_bytes.__file__).resolve().is_relative_to(release_python_root)
-assert red_pitaya_service._parse_args(["--spool", "/tmp/euv-acquisition-preflight"]).spool == "/tmp/euv-acquisition-preflight"
+required_legacy_symbols = {
+    "RP_CH_1",
+    "RP_DEC_1",
+    "RP_OK",
+    "RP_TRIG_SRC_EXT_PE",
+    "RP_TRIG_STATE_TRIGGERED",
+    "fBuffer",
+    "rp_AcqGetBufferFillState",
+    "rp_AcqGetDataV",
+    "rp_AcqGetTriggerState",
+    "rp_AcqGetWritePointerAtTrig",
+    "rp_AcqReset",
+    "rp_AcqSetDecimation",
+    "rp_AcqSetTriggerDelay",
+    "rp_AcqSetTriggerSrc",
+    "rp_AcqStart",
+    "rp_Init",
+    "rp_Release",
+}
+missing_legacy_symbols = sorted(name for name in required_legacy_symbols if not hasattr(rp, name))
+assert not missing_legacy_symbols, missing_legacy_symbols
+with tempfile.TemporaryDirectory(prefix="euv-acquisition-config-") as spool:
+    args = red_pitaya_service._parse_args([
+        "--spool", spool,
+        "--capture-mode", "legacy-single-shot",
+        "--capture-queue-capacity", "32",
+        "--persistence-queue-capacity", "8",
+        "--control-queue-capacity", "512",
+        "--pipeline-drain-timeout-seconds", "10",
+    ])
+    server = red_pitaya_service._build_server(args)
+    assert server.engine.source.state == "stopped"
+    assert server.engine.source.requested_capture_mode == "legacy-single-shot"
+    assert server.config.capture_queue_capacity == 32
+    assert server.config.persistence_queue_capacity == 8
+    assert server.config.control_queue_capacity == 512
+    assert server.config.pipeline_drain_timeout_seconds == 10.0
 assert SimulatorFaultControls().status_value()["pll_locked"] is True
 assert TCPClientSocket is not None
 assert DDSClient is not None

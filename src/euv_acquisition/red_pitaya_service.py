@@ -13,7 +13,7 @@ from euv_acquisition.models import CaptureConfig
 from euv_acquisition.service import AcquisitionServer, ServiceConfig
 from euv_acquisition.session import CaptureEngine, RotationConfig, SpoolRepository
 from euv_acquisition.snapshot import SnapshotStore
-from euv_acquisition.sources.red_pitaya import RedPitayaPulseSource
+from euv_acquisition.sources.red_pitaya import CaptureMode, RedPitayaPulseSource
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -24,6 +24,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--artifact-port", type=int, default=11761)
     parser.add_argument("--controller-watchdog-seconds", type=float, default=5.0)
     parser.add_argument("--capture-poll-seconds", type=float, default=0.001)
+    parser.add_argument("--capture-queue-capacity", type=int, default=32)
+    parser.add_argument("--persistence-queue-capacity", type=int, default=8)
+    parser.add_argument("--control-queue-capacity", type=int, default=512)
+    parser.add_argument("--pipeline-drain-timeout-seconds", type=float, default=10.0)
     parser.add_argument("--source-id", default=socket.gethostname())
     parser.add_argument("--sample-rate-hz", type=float, default=125_000_000.0)
     parser.add_argument("--window-microseconds", type=float, default=10.0)
@@ -32,6 +36,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--clipping-fraction", type=float, default=0.99)
     parser.add_argument("--prefill-seconds", type=float, default=0.001)
     parser.add_argument("--debounce-microseconds", type=float, default=1.0)
+    parser.add_argument(
+        "--capture-mode",
+        choices=[mode.value for mode in CaptureMode],
+        default=os.environ.get("EUV_CAPTURE_MODE", CaptureMode.LEGACY_SINGLE_SHOT.value),
+    )
+    parser.add_argument("--axi-minimum-buffer-seconds", type=float, default=0.05)
     parser.add_argument("--snapshot-pulse-limit", type=int, default=250)
     parser.add_argument("--snapshot-wall-seconds", type=float, default=5.0)
     parser.add_argument("--trigger-idle-seconds", type=float, default=0.5)
@@ -53,6 +63,8 @@ def _build_server(args: argparse.Namespace, *, logger=None) -> AcquisitionServer
         capture_config,
         prefill_seconds=args.prefill_seconds,
         debounce_microseconds=args.debounce_microseconds,
+        capture_mode=args.capture_mode,
+        axi_minimum_buffer_seconds=args.axi_minimum_buffer_seconds,
     )
     snapshot_store = SnapshotStore(args.spool)
     spool = SpoolRepository(args.spool)
@@ -76,6 +88,10 @@ def _build_server(args: argparse.Namespace, *, logger=None) -> AcquisitionServer
             artifact_port=args.artifact_port,
             controller_watchdog_seconds=args.controller_watchdog_seconds,
             capture_poll_seconds=args.capture_poll_seconds,
+            capture_queue_capacity=args.capture_queue_capacity,
+            persistence_queue_capacity=args.persistence_queue_capacity,
+            control_queue_capacity=args.control_queue_capacity,
+            pipeline_drain_timeout_seconds=args.pipeline_drain_timeout_seconds,
         ),
         logger=logger,
     )

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
+from euv_acquisition.pipeline import CapturePipeline, PipelineConfig
 from euv_acquisition.protocol import (
     PROTOCOL_VERSION,
     command_message,
@@ -22,7 +23,7 @@ from euv_acquisition.protocol import (
     validate_command_message,
     validate_response_message,
 )
-from euv_acquisition.session import CaptureEngine, CapturePurpose, CaptureSessionManifest, CaptureSessionState
+from euv_acquisition.session import CaptureEngine, CapturePurpose, CaptureSessionState, CaptureUpdate
 from euv_acquisition.snapshot import SnapshotManifest
 
 
@@ -45,16 +46,40 @@ class ServiceConfig:
     artifact_port: int = 11761
     controller_watchdog_seconds: float = 5.0
     capture_poll_seconds: float = 0.001
+    capture_queue_capacity: int = 32
+    persistence_queue_capacity: int = 8
+    control_queue_capacity: int = 512
+    pipeline_drain_timeout_seconds: float = 10.0
 
     def __post_init__(self) -> None:
         for name in ("control_port", "artifact_port"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 65535:
                 raise ValueError(f"{name} must be a TCP port number.")
-        for name in ("controller_watchdog_seconds", "capture_poll_seconds"):
+        for name in (
+            "capture_queue_capacity",
+            "persistence_queue_capacity",
+            "control_queue_capacity",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer.")
+        for name in (
+            "controller_watchdog_seconds",
+            "capture_poll_seconds",
+            "pipeline_drain_timeout_seconds",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
                 raise ValueError(f"{name} must be positive.")
+
+
+@dataclass(frozen=True)
+class _QueuedControlFrame:
+    connection: socket.socket
+    generation: int
+    value: dict[str, Any]
+    enqueued_at_monotonic_ns: int
 
 
 class AcquisitionServer:
@@ -74,9 +99,28 @@ class AcquisitionServer:
         self._control_listener: socket.socket | None = None
         self._artifact_listener: socket.socket | None = None
         self._control_connection: socket.socket | None = None
-        self._control_send_lock = threading.Lock()
         self._control_lock = threading.Lock()
+        self._control_generation = 0
+        self._control_outbox: queue.Queue[_QueuedControlFrame] = queue.Queue(
+            maxsize=config.control_queue_capacity
+        )
+        self.pipeline = CapturePipeline(
+            engine,
+            PipelineConfig(
+                capture_queue_capacity=config.capture_queue_capacity,
+                persistence_queue_capacity=config.persistence_queue_capacity,
+                capture_poll_seconds=config.capture_poll_seconds,
+                drain_timeout_seconds=config.pipeline_drain_timeout_seconds,
+            ),
+            emit_update=self._handle_pipeline_update,
+        )
+        self.engine.metrics.observe_queue(
+            "control",
+            depth=0,
+            capacity=config.control_queue_capacity,
+        )
         self._last_controller_activity = 0.0
+        self._last_metrics_log = 0.0
         self._threads: list[threading.Thread] = []
 
     @property
@@ -115,9 +159,10 @@ class AcquisitionServer:
             source_id=self.engine.source_id,
         )
         self._threads = [
+            threading.Thread(target=self._write_control, name="euv-control-writer", daemon=True),
             threading.Thread(target=self._accept_control, name="euv-control-accept", daemon=True),
             threading.Thread(target=self._accept_artifact, name="euv-artifact-accept", daemon=True),
-            threading.Thread(target=self._capture_loop, name="euv-capture", daemon=True),
+            threading.Thread(target=self._capture_loop, name="euv-pipeline-monitor", daemon=True),
         ]
         for thread in self._threads:
             thread.start()
@@ -125,10 +170,17 @@ class AcquisitionServer:
     def close(self) -> None:
         self._log("Acquisition server shutdown requested.", event="acquisition_server_stopping")
         self._stop.set()
-        if self.engine.active:
-            update = self.engine.abort("Acquisition server is shutting down.")
+        was_active = self.pipeline.active
+        try:
+            self.pipeline.shutdown("Acquisition server is shutting down.")
+        except Exception as exc:
+            self._log(
+                f"Capture pipeline shutdown failed: {type(exc).__name__}: {exc}",
+                level="ERROR",
+                event="pipeline_shutdown_failed",
+            )
+        if was_active:
             self._log("Aborted active capture because the acquisition server is shutting down.", level="WARNING", event="capture_aborted")
-            self._emit_update(update)
         for listener in (self._control_listener, self._artifact_listener):
             if listener is not None:
                 listener.close()
@@ -162,6 +214,7 @@ class AcquisitionServer:
             with self._control_lock:
                 active = self._control_connection
                 if active is None:
+                    self._control_generation += 1
                     self._control_connection = connection
                     self._last_controller_activity = time.monotonic()
                     accepted = True
@@ -231,6 +284,48 @@ class AcquisitionServer:
             connection.close()
             self._log("Control connection closed.", event="control_connection_closed")
 
+    def _write_control(self) -> None:
+        while not self._stop.is_set() or not self._control_outbox.empty():
+            try:
+                queued = self._control_outbox.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            try:
+                with self._control_lock:
+                    current = (
+                        self._control_connection is queued.connection
+                        and self._control_generation == queued.generation
+                    )
+                if current:
+                    send_started_ns = time.monotonic_ns()
+                    self.engine.metrics.record_duration(
+                        "outbound_queue_wait",
+                        send_started_ns - queued.enqueued_at_monotonic_ns,
+                    )
+                    send_frame(queued.connection, queued.value)
+                    sent_at_ns = time.monotonic_ns()
+                    self.engine.metrics.record_duration("socket_send", sent_at_ns - send_started_ns)
+                    self.engine.metrics.increment("control_frames_sent")
+                    if queued.value.get("type") == "pulse_report":
+                        self.engine.metrics.increment("reports_sent")
+                        report = queued.value.get("report")
+                        captured_at_ns = report.get("captured_at_monotonic_ns") if isinstance(report, dict) else None
+                        if (
+                            isinstance(captured_at_ns, int)
+                            and not isinstance(captured_at_ns, bool)
+                            and captured_at_ns <= sent_at_ns
+                        ):
+                            self.engine.metrics.record_duration("trigger_to_report", sent_at_ns - captured_at_ns)
+            except (OSError, ValueError) as exc:
+                self._fail_control_transport(queued.connection, queued.generation, exc)
+            finally:
+                self._control_outbox.task_done()
+                self.engine.metrics.observe_queue(
+                    "control",
+                    depth=self._control_outbox.qsize(),
+                    capacity=self.config.control_queue_capacity,
+                )
+
     def _accept_artifact(self) -> None:
         assert self._artifact_listener is not None
         while not self._stop.is_set():
@@ -281,7 +376,7 @@ class AcquisitionServer:
 
     def _capture_loop(self) -> None:
         while not self._stop.is_set():
-            if self.engine.active:
+            if self.pipeline.active and not self.pipeline.stopping:
                 try:
                     with self._control_lock:
                         inactive_for = time.monotonic() - self._last_controller_activity
@@ -292,24 +387,18 @@ class AcquisitionServer:
                             event="capture_watchdog_timeout",
                             inactive_seconds=inactive_for,
                         )
-                        self._emit_update(self.engine.abort("Controlling client heartbeat timed out."))
-                    else:
-                        self._emit_update(self.engine.capture_once())
+                        self.pipeline.request_abort("Controlling client heartbeat timed out.")
                 except Exception as exc:
                     self._log(
-                        f"Capture loop failed: {type(exc).__name__}: {exc}",
+                        f"Pipeline monitor failed: {type(exc).__name__}: {exc}",
                         level="ERROR",
-                        event="capture_loop_failed",
+                        event="pipeline_monitor_failed",
                     )
-                    if self.engine.active:
-                        try:
-                            self._emit_update(self.engine.abort(f"Capture loop failure: {type(exc).__name__}: {exc}"))
-                        except Exception as abort_exc:
-                            self._log(
-                                f"Capture-loop abort also failed: {type(abort_exc).__name__}: {abort_exc}",
-                                level="ERROR",
-                                event="capture_loop_abort_failed",
-                            )
+                    self.pipeline.request_abort(f"Pipeline monitor failure: {type(exc).__name__}: {exc}")
+            now = time.monotonic()
+            if self.pipeline.active and now - self._last_metrics_log >= 5.0:
+                self._log_pipeline_metrics(event="pipeline_metrics_summary")
+                self._last_metrics_log = now
             self._stop.wait(self.config.capture_poll_seconds)
 
     def _handle_command(self, command: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -317,7 +406,8 @@ class AcquisitionServer:
             if "session_id" not in payload or set(payload) - {"session_id", "purpose"}:
                 raise ValueError("start_capture requires session_id and accepts optional purpose.")
             purpose = CapturePurpose(str(payload.get("purpose", CapturePurpose.EXPERIMENT.value)))
-            session_id = self.engine.start(UUID(str(payload["session_id"])), purpose)
+            session_id = self.pipeline.start_capture(UUID(str(payload["session_id"])), purpose)
+            self._last_metrics_log = time.monotonic()
             self._log(
                 f"Started {purpose.value} capture session {session_id}.",
                 event="capture_started",
@@ -333,18 +423,17 @@ class AcquisitionServer:
             if set(payload) - allowed:
                 raise ValueError("stop_capture accepts only an optional reason.")
             reason = str(payload.get("reason", "Capture stop requested."))
-            update = self.engine.stop(reason)
+            self.pipeline.stop_capture(reason)
             self._log(
                 f"Stopped capture session {self.engine.session_id}: {reason}",
                 event="capture_stopped",
                 reason=reason,
             )
-            self._emit_update(update)
             return self._status_value()
         if command == "flush_snapshot":
             if payload:
                 raise ValueError("flush_snapshot does not accept payload fields.")
-            self._emit_update(self.engine.flush())
+            self.pipeline.flush()
             self._log("Flushed the active capture snapshot.", event="capture_snapshot_flushed")
             return self._status_value()
         if command == "status":
@@ -435,13 +524,16 @@ class AcquisitionServer:
                 "purge_snapshot": True,
                 "discard_diagnostic_session": True,
                 "simulator_controls": self._simulator_controls is not None,
+                "asynchronous_control_writer": True,
+                "pipeline_metrics": True,
             },
             "simulator": None if self._simulator_controls is None else self._simulator_controls.status_value(),
             "capture_active": self.engine.active,
             "session": None if session is None else session.to_dict(),
+            "pipeline_metrics": self.engine.metrics.snapshot(),
         }
 
-    def _emit_update(self, update) -> None:
+    def _emit_update(self, update: CaptureUpdate) -> None:
         for manifest in update.closed_snapshots:
             self._log(
                 f"Closed snapshot {manifest.filename} with {manifest.pulse_count} pulse(s).",
@@ -476,24 +568,86 @@ class AcquisitionServer:
                 }
             )
 
+    def _handle_pipeline_update(self, update: CaptureUpdate) -> None:
+        self._emit_update(update)
+        if update.stop_reason is not None:
+            self._log_pipeline_metrics(event="pipeline_metrics_final")
+
+    def _log_pipeline_metrics(self, *, event: str) -> None:
+        snapshot = self.engine.metrics.snapshot()
+        self._log(
+            f"Pipeline metrics: state={snapshot['state']}, counters={snapshot['counters']}.",
+            event=event,
+            pipeline_metrics=snapshot,
+        )
+
     def _send_control(self, value: dict[str, Any]) -> None:
         with self._control_lock:
             connection = self._control_connection
+            generation = self._control_generation
         if connection is None:
             return
         try:
-            with self._control_send_lock:
-                send_frame(connection, value)
-        except OSError:
-            self._log(
-                f"Failed to send control message of type {value.get('type')}.",
-                level="ERROR",
-                event="control_response_send_failed",
-                message_type=value.get("type"),
+            self._control_outbox.put_nowait(
+                _QueuedControlFrame(connection, generation, value, time.monotonic_ns())
             )
-            with self._control_lock:
-                if self._control_connection is connection:
-                    self._control_connection = None
+            self.engine.metrics.increment("control_frames_queued")
+            if value.get("type") == "pulse_report":
+                self.engine.metrics.increment("reports_queued")
+            self.engine.metrics.observe_queue(
+                "control",
+                depth=self._control_outbox.qsize(),
+                capacity=self.config.control_queue_capacity,
+            )
+        except queue.Full:
+            self.engine.metrics.increment("control_queue_overflow")
+            self._fail_control_transport(
+                connection,
+                generation,
+                RuntimeError(
+                    f"Control send queue reached its capacity of {self.config.control_queue_capacity} frame(s)."
+                ),
+            )
+
+    def _fail_control_transport(
+        self,
+        connection: socket.socket,
+        generation: int,
+        error: Exception,
+    ) -> None:
+        with self._control_lock:
+            if self._control_connection is not connection or self._control_generation != generation:
+                return
+            self._control_connection = None
+            self._control_generation += 1
+        self._log(
+            f"Control transport failed: {type(error).__name__}: {error}",
+            level="ERROR",
+            event="control_response_send_failed",
+            error=f"{type(error).__name__}: {error}",
+        )
+        try:
+            connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        connection.close()
+        reason = f"Control transport failed: {type(error).__name__}: {error}"
+        try:
+            aborted = self.pipeline.request_abort(reason)
+        except Exception as abort_exc:
+            self._log(
+                f"Control-transport abort failed: {type(abort_exc).__name__}: {abort_exc}",
+                level="ERROR",
+                event="control_transport_abort_failed",
+            )
+        else:
+            if aborted:
+                self._log(
+                    "Aborted active capture after control transport failure.",
+                    level="ERROR",
+                    event="capture_aborted",
+                    reason=reason,
+                )
 
     def _log(self, message: str, *, level: str = "INFO", event: str | None = None, **data: Any) -> None:
         print(f"[EUV Acquisition Service] {message}", flush=True)

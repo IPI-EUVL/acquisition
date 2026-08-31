@@ -1,12 +1,14 @@
 import time
+import threading
 from collections import deque
 from uuid import uuid4
 
 import numpy as np
 
+import euv_acquisition.service as service_module
 from euv_acquisition.models import CaptureConfig, CapturedPulse
 from euv_acquisition.service import AcquisitionClient, AcquisitionServer, ServiceConfig
-from euv_acquisition.session import CaptureEngine, RotationConfig, SpoolRepository
+from euv_acquisition.session import CaptureEngine, CaptureSessionState, RotationConfig, SpoolRepository
 from euv_acquisition.simulator_controls import SimulatorFaultControls
 from euv_acquisition.snapshot import SnapshotStore
 
@@ -24,6 +26,7 @@ class QueuePulseSource:
         self.capture_config = CaptureConfig(sample_rate_hz=1_000_000.0, window_seconds=4e-6, pretrigger_seconds=1e-6)
         self._timestamps = deque(timestamps)
         self._open = False
+        self.captured_count = 0
 
     def open(self):
         self._open = True
@@ -32,13 +35,23 @@ class QueuePulseSource:
         if not self._open or not self._timestamps:
             return None
         timestamp = self._timestamps.popleft()
+        self.captured_count += 1
         return CapturedPulse(np.array([0.0, 0.2, 0.2, 0.0], dtype=np.float32), timestamp, timestamp)
 
     def close(self):
         self._open = False
 
 
-def _server(tmp_path, *, timestamps=(1, 2), watchdog=5.0, logger=None, simulator_controls=None):
+def _server(
+    tmp_path,
+    *,
+    timestamps=(1, 2),
+    watchdog=5.0,
+    logger=None,
+    simulator_controls=None,
+    control_queue_capacity=512,
+    start=True,
+):
     source = QueuePulseSource(timestamps)
     store = SnapshotStore(tmp_path / "spool")
     spool = SpoolRepository(tmp_path / "spool", server_boot_id=uuid4())
@@ -52,11 +65,18 @@ def _server(tmp_path, *, timestamps=(1, 2), watchdog=5.0, logger=None, simulator
     )
     server = AcquisitionServer(
         engine,
-        ServiceConfig(control_port=0, artifact_port=0, capture_poll_seconds=0.001, controller_watchdog_seconds=watchdog),
+        ServiceConfig(
+            control_port=0,
+            artifact_port=0,
+            capture_poll_seconds=0.001,
+            controller_watchdog_seconds=watchdog,
+            control_queue_capacity=control_queue_capacity,
+        ),
         logger=logger,
         simulator_controls=simulator_controls,
     )
-    server.start()
+    if start:
+        server.start()
     return server
 
 
@@ -85,6 +105,167 @@ def test_service_streams_reports_transfers_artifact_and_releases_spool(tmp_path)
     finally:
         client.close()
         server.close()
+
+
+def test_slow_report_send_does_not_stall_capture(tmp_path, monkeypatch) -> None:
+    server = _server(tmp_path, timestamps=())
+    client = AcquisitionClient(server.control_address, server.artifact_address)
+    client.connect()
+    send_started = threading.Event()
+    release_send = threading.Event()
+    real_send_frame = service_module.send_frame
+
+    def slow_send_frame(connection, value):
+        if value.get("type") == "pulse_report" and not send_started.is_set():
+            send_started.set()
+            release_send.wait(timeout=1.0)
+        real_send_frame(connection, value)
+
+    monkeypatch.setattr(service_module, "send_frame", slow_send_frame)
+    try:
+        client.command("start_capture", {"session_id": str(uuid4())})
+        source = server.engine.source
+        source._timestamps.extend(range(1, 9))
+
+        assert send_started.wait(timeout=1.0)
+        deadline = time.monotonic() + 0.5
+        while source.captured_count < 8 and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+        assert source.captured_count == 8
+        release_send.set()
+        reports = [client.get_report(timeout=1.0) for _ in range(8)]
+        assert [report["sequence"] for report in reports] == list(range(8))
+        client.command("stop_capture")
+    finally:
+        release_send.set()
+        client.close()
+        server.close()
+
+
+def test_control_queue_overflow_aborts_intake_and_drains_accepted_pulses(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    logger = _Logger()
+    server = _server(
+        tmp_path,
+        timestamps=(),
+        logger=logger,
+        control_queue_capacity=1,
+    )
+    client = AcquisitionClient(server.control_address, server.artifact_address)
+    client.connect()
+    send_started = threading.Event()
+    release_send = threading.Event()
+    real_send_frame = service_module.send_frame
+
+    def blocking_send_frame(connection, value):
+        if (
+            threading.current_thread().name == "euv-control-writer"
+            and service_module.is_heartbeat(value)
+            and not send_started.is_set()
+        ):
+            send_started.set()
+            release_send.wait(timeout=1.0)
+        real_send_frame(connection, value)
+
+    try:
+        client.command("start_capture", {"session_id": str(uuid4())})
+        monkeypatch.setattr(service_module, "send_frame", blocking_send_frame)
+        client.heartbeat()
+        assert send_started.wait(timeout=1.0)
+        server.engine.source._timestamps.extend(range(1, 9))
+        deadline = time.monotonic() + 2.0
+        while server.pipeline.active and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+        assert server.pipeline.active is False
+        metrics = server.engine.metrics.snapshot()
+        accepted = metrics["counters"]["accepted"]
+        assert metrics["counters"]["control_queue_overflow"] == 1
+        assert metrics["counters"]["persisted"] == accepted
+        assert metrics["terminal_error"].startswith("Control transport failed: RuntimeError:")
+        session = server.engine.spool.load()
+        assert session.state is CaptureSessionState.STOPPED
+        assert session.final_sequence == accepted - 1
+        failures = [record for record in logger.records if record[1].get("event") == "control_response_send_failed"]
+        assert len(failures) == 1
+    finally:
+        release_send.set()
+        client.close()
+        server.close()
+
+
+def test_control_send_failure_aborts_intake_and_drains_accepted_pulses(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    logger = _Logger()
+    server = _server(tmp_path, timestamps=(), logger=logger)
+    client = AcquisitionClient(server.control_address, server.artifact_address)
+    client.connect()
+    real_send_frame = service_module.send_frame
+
+    def failing_send_frame(connection, value):
+        if (
+            threading.current_thread().name == "euv-control-writer"
+            and value.get("type") == "pulse_report"
+        ):
+            raise OSError("send fixture failed")
+        real_send_frame(connection, value)
+
+    try:
+        client.command("start_capture", {"session_id": str(uuid4())})
+        monkeypatch.setattr(service_module, "send_frame", failing_send_frame)
+        server.engine.source._timestamps.extend(range(1, 9))
+
+        deadline = time.monotonic() + 2.0
+        while server.pipeline.active and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+        assert server.pipeline.active is False
+        metrics = server.engine.metrics.snapshot()
+        accepted = metrics["counters"]["accepted"]
+        assert metrics["counters"]["persisted"] == accepted
+        assert metrics["terminal_error"] == "Control transport failed: OSError: send fixture failed"
+        session = server.engine.spool.load()
+        assert session.state is CaptureSessionState.STOPPED
+        assert session.final_sequence == accepted - 1
+        failures = [record for record in logger.records if record[1].get("event") == "control_response_send_failed"]
+        assert len(failures) == 1
+    finally:
+        client.close()
+        server.close()
+
+
+def test_control_writer_discards_frames_from_stale_connection_generations(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    server = _server(tmp_path, timestamps=(), start=False)
+    stale_connection = object()
+    current_connection = object()
+    server._control_connection = current_connection
+    server._control_generation = 2
+    server._control_outbox.put_nowait(
+        service_module._QueuedControlFrame(
+            stale_connection,
+            1,
+            {"type": "pulse_report", "report": {}},
+            time.monotonic_ns(),
+        )
+    )
+    sent = []
+    monkeypatch.setattr(service_module, "send_frame", lambda connection, value: sent.append((connection, value)))
+
+    server._stop.set()
+    server._write_control()
+
+    assert sent == []
+    assert server._control_connection is current_connection
+    assert server._control_generation == 2
+    assert server._control_outbox.empty()
 
 
 def test_service_watchdog_stops_capture_without_heartbeats(tmp_path) -> None:
@@ -169,8 +350,12 @@ def test_service_reports_capabilities_and_defaults_capture_to_experiment(tmp_pat
             "purge_snapshot": True,
             "discard_diagnostic_session": True,
             "simulator_controls": False,
+            "asynchronous_control_writer": True,
+            "pipeline_metrics": True,
         }
         assert status["simulator"] is None
+        assert status["pipeline_metrics"]["schema_version"] == 1
+        assert status["pipeline_metrics"]["state"] == "idle"
         assert started["session"]["purpose"] == "experiment"
         client.command("stop_capture")
     finally:

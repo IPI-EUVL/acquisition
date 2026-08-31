@@ -10,10 +10,11 @@ Group=root
 Environment="PYTHONUNBUFFERED=1"
 Environment="PYTHONPATH=/opt/euv-acquisition/current/python:/opt/redpitaya/lib/python"
 Environment="LD_LIBRARY_PATH=/opt/euv-acquisition/current/lib"
-ExecStart=/usr/bin/python3 -m euv_acquisition.red_pitaya_service --spool /var/lib/euv-acquisition/spool --host 0.0.0.0 --log-host 10.11.13.1 --log-port 11751
+Environment="EUV_CAPTURE_MODE=legacy-single-shot"
+ExecStart=/usr/bin/python3 -m euv_acquisition.red_pitaya_service --spool /var/lib/euv-acquisition/spool --host 0.0.0.0 --capture-queue-capacity 32 --persistence-queue-capacity 8 --control-queue-capacity 512 --pipeline-drain-timeout-seconds 10 --log-host 10.11.13.1 --log-port 11751
 Restart=on-failure
 RestartSec=2s
-TimeoutStopSec=15s
+TimeoutStopSec=30s
 KillSignal=SIGTERM
 StateDirectory=euv-acquisition
 StateDirectoryMode=0700
