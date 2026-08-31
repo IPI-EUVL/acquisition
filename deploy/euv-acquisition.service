@@ -1,0 +1,23 @@
+[Unit]
+Description=IPI EUV Acquisition Service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONPATH=/opt/euv-acquisition/current/python:/opt/redpitaya/lib/python"
+Environment="LD_LIBRARY_PATH=/opt/euv-acquisition/current/lib"
+ExecStart=/usr/bin/python3 -m euv_acquisition.red_pitaya_service --spool /var/lib/euv-acquisition/spool --host 0.0.0.0 --log-host 10.11.13.1 --log-port 11751
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+KillSignal=SIGTERM
+StateDirectory=euv-acquisition
+StateDirectoryMode=0700
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

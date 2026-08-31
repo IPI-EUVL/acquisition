@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 
+from euv_acquisition.ecs_logging import open_ecs_logger
 from euv_acquisition.service import AcquisitionServer, ServiceConfig
 from euv_acquisition.session import CaptureEngine, RotationConfig, SpoolRepository
 from euv_acquisition.snapshot import SnapshotStore
@@ -39,25 +40,12 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _open_ecs_logger(host: str, port: int):
-    try:
-        from ipi_ecs.core.tcp import TCPClientSocket
-        from ipi_ecs.logging.client import LogClient
-    except ImportError as exc:
-        print(f"[EUV Acquisition Service] ECS logging unavailable: {exc}", flush=True)
-        return None, None
-    socket = TCPClientSocket()
-    socket.connect((host, port))
-    socket.start()
-    return LogClient(socket, origin_uuid=uuid.uuid4()), socket
-
-
 def main() -> int:
     args = _parse_args()
     logger = None
     logger_socket = None
     if not args.no_ecs_log:
-        logger, logger_socket = _open_ecs_logger(args.log_host, args.log_port)
+        logger, logger_socket = open_ecs_logger(args.log_host, args.log_port)
     if logger is not None:
         logger.log(
             "Starting simulated EUV acquisition service.",

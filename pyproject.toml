@@ -14,6 +14,7 @@ dependencies = [
 [project.optional-dependencies]
 storage = ["h5py>=3.11"]
 simulator-dds = ["ipi-ecs>=0.1.0"]
+ecs-log = ["ipi-ecs>=0.1.7"]
 dev = [
   "h5py>=3.11",
   "pytest>=8",
@@ -21,6 +22,7 @@ dev = [
 
 [project.scripts]
 euv-acquisition-sim = "euv_acquisition.simulator_service:main"
+euv-acquisition-red-pitaya = "euv_acquisition.red_pitaya_service:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
