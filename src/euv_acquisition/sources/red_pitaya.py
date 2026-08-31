@@ -27,7 +27,6 @@ class RedPitayaPulseSource:
         rp_api: Any | None = None,
         channel: Any | None = None,
         full_buffer_samples: int = 16_384,
-        trigger_index: int | None = None,
         prefill_seconds: float = 0.001,
         debounce_microseconds: float = 1.0,
         unix_time_ns: Callable[[], int] = time.time_ns,
@@ -35,26 +34,17 @@ class RedPitayaPulseSource:
     ) -> None:
         if isinstance(full_buffer_samples, bool) or not isinstance(full_buffer_samples, int) or full_buffer_samples < 2:
             raise ValueError("full_buffer_samples must be an integer of at least two.")
-        if trigger_index is None:
-            trigger_index = full_buffer_samples // 2
-        if not 0 <= trigger_index < full_buffer_samples:
-            raise ValueError("trigger_index must be inside the full acquisition buffer.")
+        if capture_config.window_samples > full_buffer_samples:
+            raise ValueError("Capture window must fit inside the Red Pitaya buffer.")
         if prefill_seconds < 0:
             raise ValueError("prefill_seconds must be non-negative.")
         if debounce_microseconds < 0:
             raise ValueError("debounce_microseconds must be non-negative.")
-        window_start = trigger_index - capture_config.pretrigger_samples
-        window_end = window_start + capture_config.window_samples
-        if window_start < 0 or window_end > full_buffer_samples:
-            raise ValueError("Capture window does not fit inside the Red Pitaya buffer around the trigger.")
 
         self._capture_config = capture_config
         self._rp = rp_api
         self._channel = channel
         self._full_buffer_samples = full_buffer_samples
-        self._trigger_index = trigger_index
-        self._window_start = window_start
-        self._window_end = window_end
         self._prefill_ns = int(prefill_seconds * 1e9)
         self._debounce_microseconds = debounce_microseconds
         self._unix_time_ns = unix_time_ns
@@ -105,12 +95,26 @@ class RedPitayaPulseSource:
             filled = self._status_value("rp_AcqGetBufferFillState", self._rp.rp_AcqGetBufferFillState())
             if not filled:
                 return None
+            trigger_index = self._status_value(
+                "rp_AcqGetWritePointerAtTrig",
+                self._rp.rp_AcqGetWritePointerAtTrig(),
+            )
+            if isinstance(trigger_index, bool) or not isinstance(trigger_index, int):
+                raise RuntimeError("rp_AcqGetWritePointerAtTrig did not return an integer buffer index.")
+            if not 0 <= trigger_index < self._full_buffer_samples:
+                raise RuntimeError(
+                    f"rp_AcqGetWritePointerAtTrig returned out-of-range index {trigger_index}."
+                )
             self._check(
                 "rp_AcqGetDataV",
                 self._rp.rp_AcqGetDataV(self._channel, 0, self._full_buffer_samples, self._buffer),
             )
+            window_start = (trigger_index - self._capture_config.pretrigger_samples) % self._full_buffer_samples
             values = np.asarray(
-                [self._buffer[index] for index in range(self._window_start, self._window_end)],
+                [
+                    self._buffer[(window_start + offset) % self._full_buffer_samples]
+                    for offset in range(self._capture_config.window_samples)
+                ],
                 dtype=np.float32,
             )
             pulse = CapturedPulse(

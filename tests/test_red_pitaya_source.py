@@ -15,6 +15,7 @@ class FakeRp:
     def __init__(self):
         self.triggered = False
         self.filled = False
+        self.trigger_index = 8
         self.calls = []
 
     def fBuffer(self, length):
@@ -55,6 +56,10 @@ class FakeRp:
     def rp_AcqGetBufferFillState(self):
         return self.RP_OK, self.filled
 
+    def rp_AcqGetWritePointerAtTrig(self):
+        self.calls.append("trigger_pointer")
+        return self.RP_OK, self.trigger_index
+
     def rp_AcqGetDataV(self, _channel, _start, count, buffer):
         for index in range(count):
             buffer[index] = float(index)
@@ -73,7 +78,6 @@ def test_red_pitaya_source_arms_and_reads_a_triggered_window_without_blocking() 
         config,
         rp_api=fake,
         full_buffer_samples=16,
-        trigger_index=8,
         prefill_seconds=1e-6,
         unix_time_ns=lambda: 1_000,
         monotonic_time_ns=lambda: clock[0],
@@ -100,4 +104,30 @@ def test_red_pitaya_source_arms_and_reads_a_triggered_window_without_blocking() 
         source.close()
 
     assert fake.calls.count("start") == 2
+    assert "trigger_pointer" in fake.calls
     assert fake.calls[-1] == "release"
+
+
+def test_red_pitaya_source_extracts_window_across_ring_buffer_wraparound() -> None:
+    fake = FakeRp()
+    fake.trigger_index = 1
+    fake.triggered = True
+    fake.filled = True
+    config = CaptureConfig(sample_rate_hz=1_000_000.0, window_seconds=5e-6, pretrigger_seconds=3e-6)
+    source = RedPitayaPulseSource(
+        config,
+        rp_api=fake,
+        full_buffer_samples=16,
+        prefill_seconds=0.0,
+    )
+
+    source.open()
+    try:
+        assert source.capture() is None
+        assert source.capture() is None
+        pulse = source.capture()
+
+        assert pulse is not None
+        assert pulse.samples_v.tolist() == [14.0, 15.0, 0.0, 1.0, 2.0]
+    finally:
+        source.close()
