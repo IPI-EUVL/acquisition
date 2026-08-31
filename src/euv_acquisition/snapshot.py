@@ -225,7 +225,7 @@ class SnapshotStore:
             first_capture_unix_ns=first.pulse.captured_at_unix_ns,
             final_capture_unix_ns=final.pulse.captured_at_unix_ns,
         )
-        self.verify(manifest)
+        self._verify_contents(manifest, read_snapshot(destination))
         return manifest
 
     def path_for(self, manifest: SnapshotManifest) -> Path:
@@ -239,7 +239,10 @@ class SnapshotStore:
             raise ValueError("Snapshot byte count does not match its manifest.")
         if _sha256(path) != manifest.sha256:
             raise ValueError("Snapshot SHA-256 does not match its manifest.")
-        contents = read_snapshot(path)
+        self._verify_contents(manifest, read_snapshot(path))
+
+    @staticmethod
+    def _verify_contents(manifest: SnapshotManifest, contents: SnapshotContents) -> None:
         if contents.snapshot_id != manifest.snapshot_id or contents.session_id != manifest.session_id:
             raise ValueError("Snapshot identity does not match its manifest.")
         if contents.close_reason is not manifest.close_reason:

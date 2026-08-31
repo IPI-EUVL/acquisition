@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from euv_acquisition.models import CaptureConfig
 from euv_acquisition.sources.red_pitaya import CaptureMode, RedPitayaPulseSource
@@ -106,6 +107,45 @@ def test_red_pitaya_source_arms_and_reads_a_triggered_window_without_blocking() 
     assert fake.calls.count("start") == 2
     assert "trigger_pointer" in fake.calls
     assert fake.calls[-1] == "release"
+
+
+def test_red_pitaya_source_releases_hardware_when_startup_is_interrupted(monkeypatch) -> None:
+    class StartupInterrupted(BaseException):
+        pass
+
+    fake = FakeRp()
+    config = CaptureConfig(sample_rate_hz=1_000_000.0, window_seconds=4e-6, pretrigger_seconds=1e-6)
+    source = RedPitayaPulseSource(config, rp_api=fake, full_buffer_samples=16)
+
+    def interrupt_startup() -> None:
+        raise StartupInterrupted()
+
+    monkeypatch.setattr(source, "_configure_requested_mode", interrupt_startup)
+
+    with pytest.raises(StartupInterrupted):
+        source.open()
+
+    assert source.state == "stopped"
+    assert fake.calls[-1] == "release"
+
+
+def test_red_pitaya_source_blocks_reopen_when_release_fails() -> None:
+    class ReleaseFailingRp(FakeRp):
+        def rp_Release(self):
+            self.calls.append("release")
+            return 1
+
+    fake = ReleaseFailingRp()
+    config = CaptureConfig(sample_rate_hz=1_000_000.0, window_seconds=4e-6, pretrigger_seconds=1e-6)
+    source = RedPitayaPulseSource(config, rp_api=fake, full_buffer_samples=16)
+    source.open()
+
+    with pytest.raises(RuntimeError, match="rp_Release"):
+        source.close()
+
+    assert source.release_confirmed is False
+    with pytest.raises(RuntimeError, match="release was not confirmed"):
+        source.open()
 
 
 def test_red_pitaya_source_extracts_window_across_ring_buffer_wraparound() -> None:

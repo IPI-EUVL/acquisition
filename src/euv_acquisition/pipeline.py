@@ -241,7 +241,7 @@ class CapturePipeline:
                 self._source_ready.set()
 
             while source_open and not self._stop_requested.is_set():
-                self._publish_flush_requests()
+                self._publish_flush_requests(source_open=True)
                 if self._stop_requested.is_set():
                     break
                 if self._capture_queue.qsize() >= self.config.capture_queue_capacity:
@@ -261,24 +261,25 @@ class CapturePipeline:
                 if pulse is None:
                     self._stop_requested.wait(self.config.capture_poll_seconds)
                     continue
-                try:
-                    accepted = self.engine.accept_pulse(pulse)
-                except Exception as exc:
-                    reason = f"Pulse acceptance failure: {type(exc).__name__}: {exc}"
-                    self._request_terminal(reason, terminal_error=reason)
+                if not self._accept_captured_pulse(pulse, block=False):
                     break
-                self._capture_queue.put_nowait(
-                    _AcceptedWork(accepted, self._monotonic_time_ns())
-                )
-                self._observe_capture_queue()
         finally:
-            self._publish_flush_requests()
+            self._publish_flush_requests(source_open=source_open)
             if source_open:
                 try:
                     self.engine.source.close()
                 except Exception as exc:
                     reason = f"Pulse source close failure: {type(exc).__name__}: {exc}"
                     self._request_terminal(reason, terminal_error=reason)
+                drain_captured = getattr(self.engine.source, "drain_captured", None)
+                if drain_captured is not None:
+                    try:
+                        for pulse in drain_captured():
+                            if not self._accept_captured_pulse(pulse, block=True):
+                                break
+                    except Exception as exc:
+                        reason = f"Pulse source drain failure: {type(exc).__name__}: {exc}"
+                        self._request_terminal(reason, terminal_error=reason)
             reason, terminal_error = self._terminal_values()
             self._capture_queue.put(_TerminalFence(reason, terminal_error))
             self._observe_capture_queue()
@@ -414,14 +415,47 @@ class CapturePipeline:
             finally:
                 self._persistence_queue.task_done()
 
-    def _publish_flush_requests(self) -> None:
+    def _publish_flush_requests(self, *, source_open: bool) -> None:
         while True:
             try:
                 request = self._flush_requests.get_nowait()
             except queue.Empty:
                 return
+            capture_fence = getattr(self.engine.source, "capture_fence", None)
+            if source_open and capture_fence is not None:
+                try:
+                    for pulse in capture_fence():
+                        if not self._accept_captured_pulse(pulse, block=True):
+                            break
+                except Exception as exc:
+                    request.completion.error = exc
+                    drain_captured = getattr(self.engine.source, "drain_captured", None)
+                    if drain_captured is not None:
+                        try:
+                            for pulse in drain_captured():
+                                if not self._accept_captured_pulse(pulse, block=True):
+                                    break
+                        except Exception as drain_exc:
+                            request.completion.error = drain_exc
+                    reason = f"Pulse source flush failure: {type(exc).__name__}: {exc}"
+                    self._request_terminal(reason, terminal_error=reason)
             self._capture_queue.put(request)
             self._observe_capture_queue()
+
+    def _accept_captured_pulse(self, pulse, *, block: bool) -> bool:
+        try:
+            accepted = self.engine.accept_pulse(pulse)
+        except Exception as exc:
+            reason = f"Pulse acceptance failure: {type(exc).__name__}: {exc}"
+            self._request_terminal(reason, terminal_error=reason)
+            return False
+        work = _AcceptedWork(accepted, self._monotonic_time_ns())
+        if block:
+            self._capture_queue.put(work)
+        else:
+            self._capture_queue.put_nowait(work)
+        self._observe_capture_queue()
+        return True
 
     def _queue_persistence_batch(
         self,

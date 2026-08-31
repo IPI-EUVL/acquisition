@@ -70,6 +70,8 @@ class RedPitayaPulseSource:
         self._monotonic_time_ns = monotonic_time_ns
         self._metrics = metrics or PipelineMetrics()
         self._buffer = None
+        self._initialized = False
+        self._release_confirmed = True
         self._state = _AcquisitionState.STOPPED
         self._started_monotonic_ns = 0
         self._state_started_monotonic_ns = 0
@@ -100,20 +102,28 @@ class RedPitayaPulseSource:
     def capture_fallback_reason(self) -> str | None:
         return self._capture_fallback_reason
 
+    @property
+    def release_confirmed(self) -> bool:
+        return self._release_confirmed
+
     def set_metrics(self, metrics: PipelineMetrics) -> None:
         self._metrics = metrics
 
     def open(self) -> None:
+        if self._initialized or not self._release_confirmed:
+            raise RuntimeError("Previous Red Pitaya hardware release was not confirmed.")
         if self._state is not _AcquisitionState.STOPPED:
             raise RuntimeError("Red Pitaya pulse source is already open.")
         if self._rp is None:
             self._rp = importlib.import_module("rp")
         if self._channel is None:
             self._channel = self._rp.RP_CH_1
-        self._check("rp_Init", self._rp.rp_Init())
+        self._initialized = True
+        self._release_confirmed = False
         try:
+            self._check("rp_Init", self._rp.rp_Init())
             self._configure_requested_mode()
-        except Exception:
+        except BaseException:
             try:
                 self._release_failed_open()
             finally:
@@ -233,14 +243,14 @@ class RedPitayaPulseSource:
         raise RuntimeError(f"Unknown Red Pitaya acquisition state {self._state!r}.")
 
     def close(self) -> None:
-        if self._state is _AcquisitionState.STOPPED:
+        if self._state is _AcquisitionState.STOPPED and not self._initialized:
             return
-        first_error: Exception | None = None
+        first_error: BaseException | None = None
         try:
             if hasattr(self._rp, "rp_AcqStop"):
                 try:
                     self._check("rp_AcqStop", self._rp.rp_AcqStop())
-                except Exception as exc:
+                except BaseException as exc:
                     first_error = exc
             if self._axi_enabled:
                 for name, call in (
@@ -249,20 +259,22 @@ class RedPitayaPulseSource:
                 ):
                     try:
                         self._check(name, call())
-                    except Exception as exc:
+                    except BaseException as exc:
                         if first_error is None:
                             first_error = exc
         finally:
             try:
                 try:
                     self._check("rp_Release", self._rp.rp_Release())
-                except Exception as exc:
+                    self._release_confirmed = True
+                except BaseException as exc:
                     if first_error is None:
                         first_error = exc
             finally:
                 self._buffer = None
                 self._axi_enabled = False
                 self._axi_buffer_samples = 0
+                self._initialized = not self._release_confirmed
                 self._state = _AcquisitionState.STOPPED
         if first_error is not None:
             raise first_error
@@ -416,9 +428,26 @@ class RedPitayaPulseSource:
         self._state = _AcquisitionState.STOPPED
 
     def _release_failed_open(self) -> None:
-        self._disable_axi_best_effort()
-        self._rp.rp_Release()
-        self._buffer = None
+        first_error: BaseException | None = None
+        try:
+            try:
+                self._disable_axi_best_effort()
+            except BaseException as exc:
+                first_error = exc
+            if self._initialized:
+                try:
+                    self._check("rp_Release", self._rp.rp_Release())
+                    self._release_confirmed = True
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+        finally:
+            self._buffer = None
+            self._axi_enabled = False
+            self._axi_buffer_samples = 0
+            self._initialized = not self._release_confirmed
+        if first_error is not None:
+            raise first_error
 
     def _check(self, name: str, result: Any) -> None:
         code = result[0] if isinstance(result, (tuple, list)) else result

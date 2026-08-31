@@ -431,6 +431,14 @@ class CaptureEngine:
             effective_mode=effective,
             fallback_reason=fallback_reason,
         )
+        worker_pid = getattr(self.source, "worker_pid", None)
+        if worker_pid is not None:
+            self.metrics.set_capture_worker(
+                pid=worker_pid,
+                cpu=getattr(self.source, "worker_cpu", None),
+                scheduler=str(getattr(self.source, "worker_scheduler", "unknown")),
+                realtime_priority=int(getattr(self.source, "worker_realtime_priority", 0)),
+            )
 
     def accept_pulse(self, pulse: CapturedPulse) -> AcceptedPulse:
         with self._lock:

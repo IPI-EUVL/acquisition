@@ -76,15 +76,18 @@ def test_artifact_transfer_streams_and_verifies_hash(tmp_path) -> None:
     assert (tmp_path / "received" / manifest.filename).read_bytes() == store.path_for(manifest).read_bytes()
 
 
-def test_artifact_transfer_rejects_manifest_hash_mismatch(tmp_path) -> None:
+def test_artifact_receiver_rejects_manifest_hash_mismatch(tmp_path) -> None:
     store, manifest = _snapshot(tmp_path)
     corrupted = manifest.to_dict()
     corrupted["sha256"] = "0" * 64
     bad_manifest = type(manifest).from_dict(corrupted)
     sender, receiver = socket.socketpair()
     try:
-        with pytest.raises(ValueError, match="byte count|SHA-256"):
-            send_artifact(sender, bad_manifest, store.path_for(manifest))
+        send_artifact(sender, bad_manifest, store.path_for(manifest))
+        with pytest.raises(ValueError, match="SHA-256"):
+            receive_artifact(receiver, tmp_path / "received-corrupt")
     finally:
         sender.close()
         receiver.close()
+
+    assert list((tmp_path / "received-corrupt").iterdir()) == []

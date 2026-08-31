@@ -5,6 +5,7 @@ import h5py
 import numpy as np
 import pytest
 
+import euv_acquisition.snapshot as snapshot_module
 from euv_acquisition.analysis import analyze_pulse
 from euv_acquisition.models import CaptureConfig, CapturedPulse, PulseRecord, SnapshotCloseReason
 from euv_acquisition.snapshot import SnapshotManifest, SnapshotStore, read_snapshot
@@ -73,6 +74,25 @@ def test_snapshot_store_rejects_empty_and_noncontiguous_records(tmp_path) -> Non
             SnapshotCloseReason.EXPLICIT_FLUSH,
             source_kind="simulated",
             source_id="test",
+        )
+
+
+def test_snapshot_store_semantically_validates_new_artifact(tmp_path, monkeypatch) -> None:
+    config, records = _records(1)
+    store = SnapshotStore(tmp_path)
+
+    def reject_snapshot(_path):
+        raise ValueError("semantic validation fixture")
+
+    monkeypatch.setattr(snapshot_module, "read_snapshot", reject_snapshot)
+
+    with pytest.raises(ValueError, match="semantic validation fixture"):
+        store.write(
+            records,
+            config,
+            SnapshotCloseReason.PULSE_LIMIT,
+            source_kind="simulated",
+            source_id="semantic-check",
         )
 
 

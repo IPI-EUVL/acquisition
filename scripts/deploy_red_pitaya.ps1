@@ -217,7 +217,14 @@ cd "$stage"
 printf '%s  %s\n' "$bundle_manifest_sha256" SHA256SUMS | sha256sum --check
 sha256sum --check SHA256SUMS
 grep -Fqx 'Environment="EUV_CAPTURE_MODE=legacy-single-shot"' euv-acquisition.service
-grep -Fq -- '--capture-queue-capacity 32 --persistence-queue-capacity 8 --control-queue-capacity 512 --pipeline-drain-timeout-seconds 10' euv-acquisition.service
+grep -Fq -- '--capture-queue-capacity 32' euv-acquisition.service
+grep -Fq -- '--persistence-queue-capacity 8 --control-queue-capacity 512 --pipeline-drain-timeout-seconds 10' euv-acquisition.service
+grep -Fq -- '--capture-cpu 1 --capture-realtime-priority 20' euv-acquisition.service
+grep -Fq -- '--capture-process-startup-timeout-seconds 5 --capture-process-shutdown-timeout-seconds 2' euv-acquisition.service
+grep -Fqx 'CPUAffinity=0' euv-acquisition.service
+grep -Fqx 'LimitRTPRIO=20' euv-acquisition.service
+grep -Fqx 'RestrictRealtime=no' euv-acquisition.service
+grep -Fqx 'KillMode=mixed' euv-acquisition.service
 systemd-analyze verify "$stage/euv-acquisition.service"
 
 install -d -m 0755 "$releases_root"
@@ -303,6 +310,10 @@ with tempfile.TemporaryDirectory(prefix="euv-acquisition-config-") as spool:
     server = red_pitaya_service._build_server(args)
     assert server.engine.source.state == "stopped"
     assert server.engine.source.requested_capture_mode == "legacy-single-shot"
+    assert server.engine.source.process_config.cpu == 1
+    assert server.engine.source.process_config.realtime_priority == 20
+    assert server.engine.source.process_config.startup_timeout_seconds == 5.0
+    assert server.engine.source.process_config.shutdown_timeout_seconds == 2.0
     assert server.config.capture_queue_capacity == 32
     assert server.config.persistence_queue_capacity == 8
     assert server.config.control_queue_capacity == 512
@@ -322,6 +333,62 @@ with tempfile.TemporaryDirectory(prefix="euv-acquisition-deploy-") as directory:
 print("release_preflight_ok")
 PY
 
+cat > "$stage/capture_process_preflight.py" <<'PY'
+from __future__ import annotations
+
+import time
+from functools import partial
+
+from euv_acquisition.models import CaptureConfig
+from euv_acquisition.sources.isolated import CaptureProcessConfig, IsolatedPulseSource
+from euv_acquisition.sources.simulated import SimulatedPulseConfig, SimulatedPulseSource
+
+
+def main() -> None:
+    capture_config = CaptureConfig()
+    source = IsolatedPulseSource(
+        partial(
+            SimulatedPulseSource,
+            capture_config,
+            SimulatedPulseConfig(trigger_rate_hz=96.0),
+        ),
+        capture_config,
+        requested_capture_mode="simulated",
+        process_config=CaptureProcessConfig(
+            cpu=1,
+            realtime_priority=20,
+            startup_timeout_seconds=5.0,
+            shutdown_timeout_seconds=2.0,
+        ),
+    )
+    source.open()
+    try:
+        assert source.worker_cpu == 1, source.worker_cpu
+        assert source.worker_scheduler == "fifo", source.worker_scheduler
+        assert source.worker_realtime_priority == 20, source.worker_realtime_priority
+        deadline = time.monotonic() + 2.0
+        pulse = None
+        while pulse is None and time.monotonic() < deadline:
+            pulse = source.capture()
+            if pulse is None:
+                time.sleep(0.001)
+        assert pulse is not None
+    finally:
+        source.close()
+    for queued_pulse in source.drain_captured():
+        assert len(queued_pulse.samples_v) == capture_config.window_samples
+    print("capture_process_preflight_ok")
+
+
+if __name__ == "__main__":
+    main()
+PY
+RELEASE_PYTHON_ROOT="$temporary_release/python" \
+PYTHONPATH="$temporary_release/python:/opt/redpitaya/lib/python" \
+LD_LIBRARY_PATH="$temporary_release/lib" \
+taskset -c 0 /usr/bin/python3 "$stage/capture_process_preflight.py"
+rm -f "$stage/capture_process_preflight.py"
+
     printf '%s\n' "$bundle_manifest_sha256" > "$temporary_release/.bundle-sha256"
     cp "$stage/RELEASE" "$temporary_release/RELEASE"
     find "$temporary_release" -type f -exec chmod a-w {} +
@@ -333,6 +400,12 @@ previous_release=
 if [ -L "$current_link" ]; then
     previous_release=$(readlink -f "$current_link")
 fi
+previous_unit="$stage/$unit_name.previous"
+had_previous_unit=false
+if [ -f "/etc/systemd/system/$unit_name" ]; then
+    cp -p "/etc/systemd/system/$unit_name" "$previous_unit"
+    had_previous_unit=true
+fi
 temporary_link=$application_root/.current.$$.tmp
 ln -s "$release_path" "$temporary_link"
 mv -Tf "$temporary_link" "$current_link"
@@ -343,11 +416,19 @@ systemctl enable "$unit_name" >/dev/null
 if [ "$activation" = restart ]; then
     if ! systemctl restart "$unit_name" || ! systemctl is-active --quiet "$unit_name"; then
         echo "The new release failed to start; restoring the previous release." >&2
+        if [ "$had_previous_unit" = true ]; then
+            install -m 0644 "$previous_unit" "/etc/systemd/system/$unit_name"
+        else
+            rm -f "/etc/systemd/system/$unit_name"
+        fi
+        systemctl daemon-reload
         if [ -n "$previous_release" ] && [ -d "$previous_release" ]; then
             rollback_link=$application_root/.current.rollback.$$.tmp
             ln -s "$previous_release" "$rollback_link"
             mv -Tf "$rollback_link" "$current_link"
-            systemctl restart "$unit_name" || true
+            if ! systemctl restart "$unit_name" || ! systemctl is-active --quiet "$unit_name"; then
+                echo "Rollback failed to restore the previous service; manual recovery is required." >&2
+            fi
         else
             rm -f "$current_link"
             systemctl stop "$unit_name" || true

@@ -48,6 +48,7 @@ class PipelineMetrics:
         self._requested_mode: str | None = None
         self._effective_mode: str | None = None
         self._fallback_reason: str | None = None
+        self._capture_worker: dict[str, int | str | None] | None = None
         self._terminal_error: str | None = None
         self._started_at_monotonic_ns: int | None = None
         self._finished_at_monotonic_ns: int | None = None
@@ -79,6 +80,7 @@ class PipelineMetrics:
             self._requested_mode = requested_mode
             self._effective_mode = effective_mode
             self._fallback_reason = fallback_reason
+            self._capture_worker = None
             self._terminal_error = None
             self._started_at_monotonic_ns = self._monotonic_time_ns()
             self._finished_at_monotonic_ns = None
@@ -109,6 +111,32 @@ class PipelineMetrics:
         with self._lock:
             self._stages[stage].append(duration_ns)
             self._stage_totals[stage] += 1
+
+    def set_capture_worker(
+        self,
+        *,
+        pid: int,
+        cpu: int | None,
+        scheduler: str,
+        realtime_priority: int,
+    ) -> None:
+        for name, value, minimum in (
+            ("pid", pid, 1),
+            ("realtime_priority", realtime_priority, 0),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(f"Capture worker {name} must be an integer of at least {minimum}.")
+        if cpu is not None and (isinstance(cpu, bool) or not isinstance(cpu, int) or cpu < 0):
+            raise ValueError("Capture worker CPU must be a non-negative integer or null.")
+        if not isinstance(scheduler, str) or not scheduler.strip():
+            raise ValueError("Capture worker scheduler must be non-empty text.")
+        with self._lock:
+            self._capture_worker = {
+                "pid": pid,
+                "cpu": cpu,
+                "scheduler": scheduler.strip(),
+                "realtime_priority": realtime_priority,
+            }
 
     def increment(self, counter: str, amount: int = 1) -> None:
         if not isinstance(counter, str) or not counter.strip():
@@ -168,6 +196,7 @@ class PipelineMetrics:
                     "effective": self._effective_mode,
                     "fallback_reason": self._fallback_reason,
                 },
+                "capture_worker": None if self._capture_worker is None else dict(self._capture_worker),
                 "counters": dict(sorted(self._counters.items())),
                 "queues": {name: dict(value) for name, value in sorted(self._queues.items())},
                 "stages": stages,

@@ -25,6 +25,7 @@ def test_pipeline_metrics_are_bounded_and_json_serializable() -> None:
     metrics.increment("accepted", 4)
     metrics.observe_queue("control", depth=2, capacity=8)
     metrics.observe_queue("control", depth=1, capacity=8)
+    metrics.set_capture_worker(pid=123, cpu=1, scheduler="fifo", realtime_priority=20)
 
     snapshot = metrics.snapshot()
 
@@ -34,6 +35,12 @@ def test_pipeline_metrics_are_bounded_and_json_serializable() -> None:
         "requested": "auto",
         "effective": "single-shot",
         "fallback_reason": "AXI unavailable",
+    }
+    assert snapshot["capture_worker"] == {
+        "pid": 123,
+        "cpu": 1,
+        "scheduler": "fifo",
+        "realtime_priority": 20,
     }
     assert snapshot["counters"] == {"accepted": 4}
     assert snapshot["queues"]["control"] == {"depth": 1, "capacity": 8, "high_water": 2}

@@ -7,12 +7,14 @@ import socket
 import threading
 import uuid
 from collections.abc import Sequence
+from functools import partial
 
 from euv_acquisition.ecs_logging import open_ecs_logger
 from euv_acquisition.models import CaptureConfig
 from euv_acquisition.service import AcquisitionServer, ServiceConfig
 from euv_acquisition.session import CaptureEngine, RotationConfig, SpoolRepository
 from euv_acquisition.snapshot import SnapshotStore
+from euv_acquisition.sources.isolated import CaptureProcessConfig, IsolatedPulseSource
 from euv_acquisition.sources.red_pitaya import CaptureMode, RedPitayaPulseSource
 
 
@@ -25,6 +27,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--controller-watchdog-seconds", type=float, default=5.0)
     parser.add_argument("--capture-poll-seconds", type=float, default=0.001)
     parser.add_argument("--capture-queue-capacity", type=int, default=32)
+    parser.add_argument("--capture-cpu", type=int, default=1)
+    parser.add_argument("--capture-realtime-priority", type=int, default=20)
+    parser.add_argument("--capture-process-startup-timeout-seconds", type=float, default=5.0)
+    parser.add_argument("--capture-process-shutdown-timeout-seconds", type=float, default=2.0)
     parser.add_argument("--persistence-queue-capacity", type=int, default=8)
     parser.add_argument("--control-queue-capacity", type=int, default=512)
     parser.add_argument("--pipeline-drain-timeout-seconds", type=float, default=10.0)
@@ -59,12 +65,25 @@ def _build_server(args: argparse.Namespace, *, logger=None) -> AcquisitionServer
         input_full_scale_volts=args.input_full_scale_volts,
         clipping_fraction=args.clipping_fraction,
     )
-    source = RedPitayaPulseSource(
+    source = IsolatedPulseSource(
+        partial(
+            RedPitayaPulseSource,
+            capture_config,
+            prefill_seconds=args.prefill_seconds,
+            debounce_microseconds=args.debounce_microseconds,
+            capture_mode=args.capture_mode,
+            axi_minimum_buffer_seconds=args.axi_minimum_buffer_seconds,
+        ),
         capture_config,
-        prefill_seconds=args.prefill_seconds,
-        debounce_microseconds=args.debounce_microseconds,
-        capture_mode=args.capture_mode,
-        axi_minimum_buffer_seconds=args.axi_minimum_buffer_seconds,
+        requested_capture_mode=args.capture_mode,
+        process_config=CaptureProcessConfig(
+            cpu=args.capture_cpu,
+            realtime_priority=args.capture_realtime_priority,
+            poll_seconds=args.capture_poll_seconds,
+            queue_capacity=args.capture_queue_capacity,
+            startup_timeout_seconds=args.capture_process_startup_timeout_seconds,
+            shutdown_timeout_seconds=args.capture_process_shutdown_timeout_seconds,
+        ),
     )
     snapshot_store = SnapshotStore(args.spool)
     spool = SpoolRepository(args.spool)

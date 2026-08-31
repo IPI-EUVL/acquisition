@@ -162,23 +162,18 @@ def send_artifact(connection: socket.socket, manifest: SnapshotManifest, source:
         raise FileNotFoundError(path)
     if path.name != manifest.filename:
         raise ValueError("Artifact filename does not match its manifest.")
-    if path.stat().st_size != manifest.byte_count:
-        raise ValueError("Artifact byte count does not match its manifest.")
-    digest = hashlib.sha256()
     with path.open("rb") as artifact:
-        for chunk in iter(lambda: artifact.read(ARTIFACT_CHUNK_BYTES), b""):
-            digest.update(chunk)
-    if digest.hexdigest() != manifest.sha256:
-        raise ValueError("Artifact SHA-256 does not match its manifest.")
-    header = {
-        "protocol_version": PROTOCOL_VERSION,
-        "type": "artifact",
-        "manifest": manifest.to_dict(),
-    }
-    send_frame(connection, header)
-    with path.open("rb") as artifact:
-        while chunk := artifact.read(ARTIFACT_CHUNK_BYTES):
-            connection.sendall(chunk)
+        if os.fstat(artifact.fileno()).st_size != manifest.byte_count:
+            raise ValueError("Artifact byte count does not match its manifest.")
+        header = {
+            "protocol_version": PROTOCOL_VERSION,
+            "type": "artifact",
+            "manifest": manifest.to_dict(),
+        }
+        send_frame(connection, header)
+        sent = connection.sendfile(artifact, count=manifest.byte_count)
+        if sent != manifest.byte_count:
+            raise ConnectionError(f"Artifact transfer sent {sent} of {manifest.byte_count} bytes.")
 
 
 def receive_artifact(connection: socket.socket, destination_directory: str | Path) -> SnapshotManifest:

@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 from collections import deque
@@ -11,6 +12,7 @@ from euv_acquisition.models import CaptureConfig, CapturedPulse, SnapshotCloseRe
 from euv_acquisition.pipeline import CapturePipeline, PipelineConfig
 from euv_acquisition.session import CaptureEngine, CaptureUpdate, RotationConfig, SpoolRepository
 from euv_acquisition.snapshot import SnapshotStore
+from euv_acquisition.sources.isolated import CaptureProcessConfig, IsolatedPulseSource
 
 
 class QueuePulseSource:
@@ -48,6 +50,45 @@ class QueuePulseSource:
         self.owner_threads.append(threading.current_thread().name)
         self._open = False
         self.closed.set()
+
+
+class FailingFencePulseSource:
+    def __init__(self) -> None:
+        self.capture_config = CaptureConfig(
+            sample_rate_hz=1_000_000.0,
+            window_seconds=4e-6,
+            pretrigger_seconds=1e-6,
+        )
+        self._pending = ()
+
+    def open(self) -> None:
+        return
+
+    def capture(self) -> None:
+        return None
+
+    def capture_fence(self) -> tuple[CapturedPulse, ...]:
+        self._pending = tuple(
+            CapturedPulse(
+                np.asarray([0.0, 0.1, 0.2, 0.3], dtype=np.float32),
+                timestamp,
+                timestamp,
+            )
+            for timestamp in (1, 2)
+        )
+        raise RuntimeError("flush fence fixture")
+
+    def drain_captured(self) -> tuple[CapturedPulse, ...]:
+        pending = self._pending
+        self._pending = ()
+        return pending
+
+    def close(self) -> None:
+        return
+
+
+def _make_pipeline_process_source() -> QueuePulseSource:
+    return QueuePulseSource(range(1, 9))
 
 
 def _make_pipeline(tmp_path, timestamps, *, rotation, config):
@@ -117,6 +158,84 @@ def test_capture_continues_while_persistence_is_blocked_and_stays_ordered(tmp_pa
         assert set(source.owner_threads) == {"euv-capture-producer"}
     finally:
         release_write.set()
+        pipeline.shutdown()
+
+
+def test_pipeline_runs_capture_in_spawned_process_and_drains_on_stop(tmp_path) -> None:
+    capture_config = CaptureConfig(
+        sample_rate_hz=1_000_000.0,
+        window_seconds=4e-6,
+        pretrigger_seconds=1e-6,
+    )
+    source = IsolatedPulseSource(
+        _make_pipeline_process_source,
+        capture_config,
+        requested_capture_mode="simulated",
+        process_config=CaptureProcessConfig(
+            cpu=None,
+            realtime_priority=None,
+            startup_timeout_seconds=5.0,
+            shutdown_timeout_seconds=2.0,
+        ),
+    )
+    store = SnapshotStore(tmp_path / "spool")
+    spool = SpoolRepository(tmp_path / "spool", server_boot_id=uuid4())
+    engine = CaptureEngine(
+        source,
+        store,
+        spool,
+        source_kind="simulated",
+        source_id="isolated-pipeline-test",
+        rotation=RotationConfig(pulse_limit=250, trigger_idle_seconds=100.0),
+    )
+    updates: list[CaptureUpdate] = []
+    pipeline = CapturePipeline(engine, PipelineConfig(), emit_update=updates.append)
+
+    pipeline.start_capture(uuid4())
+    worker_pid = source.worker_pid
+    try:
+        _wait_until(lambda: engine.metrics.snapshot()["counters"].get("accepted") == 8)
+        pipeline.stop_capture("isolated test complete")
+
+        metrics = engine.metrics.snapshot()
+        assert worker_pid is not None and worker_pid != os.getpid()
+        assert metrics["capture_worker"]["pid"] == worker_pid
+        assert metrics["queues"]["capture_ipc"]["capacity"] == 32
+        assert metrics["counters"]["accepted"] == 8
+        assert metrics["counters"]["analyzed"] == 8
+        assert metrics["counters"]["persisted"] == 8
+        assert spool.load().final_sequence == 7
+        assert [update.report.sequence for update in updates if update.report is not None] == list(range(8))
+    finally:
+        pipeline.shutdown()
+
+
+def test_failed_source_flush_persists_restored_pre_fence_pulses(tmp_path) -> None:
+    source = FailingFencePulseSource()
+    store = SnapshotStore(tmp_path / "spool")
+    spool = SpoolRepository(tmp_path / "spool", server_boot_id=uuid4())
+    engine = CaptureEngine(
+        source,
+        store,
+        spool,
+        source_kind="simulated",
+        source_id="failed-fence-test",
+        rotation=RotationConfig(pulse_limit=250, trigger_idle_seconds=100.0),
+    )
+    updates: list[CaptureUpdate] = []
+    pipeline = CapturePipeline(engine, PipelineConfig(), emit_update=updates.append)
+    pipeline.start_capture(uuid4())
+    try:
+        with pytest.raises(RuntimeError, match="flush fence fixture"):
+            pipeline.flush()
+        _wait_until(lambda: not pipeline.active)
+
+        metrics = engine.metrics.snapshot()
+        assert metrics["counters"]["accepted"] == 2
+        assert metrics["counters"]["persisted"] == 2
+        assert spool.load().snapshots[0].manifest.pulse_count == 2
+        assert [update.report.sequence for update in updates if update.report is not None] == [0, 1]
+    finally:
         pipeline.shutdown()
 
 
