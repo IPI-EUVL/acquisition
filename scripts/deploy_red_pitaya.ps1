@@ -12,6 +12,7 @@ $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $workspaceRoot = Split-Path $projectRoot -Parent
 $ecsSource = Join-Path $workspaceRoot "ecs"
 $mtEventsSource = Join-Path $workspaceRoot "mt_events"
+$segmentBytesSource = Join-Path $workspaceRoot "segment_bytes"
 $artifactRoot = Join-Path $projectRoot "vendor\armv7"
 $serviceUnit = Join-Path $projectRoot "deploy\euv-acquisition.service"
 $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("euv-acquisition-deploy-" + [guid]::NewGuid().ToString("N"))
@@ -79,7 +80,7 @@ if (-not (Test-Path $serviceUnit -PathType Leaf)) {
 if (-not (Test-Path $artifactRoot -PathType Container)) {
     throw "ARMv7 artifact directory does not exist: $artifactRoot"
 }
-foreach ($sourcePath in @($ecsSource, $mtEventsSource)) {
+foreach ($sourcePath in @($ecsSource, $mtEventsSource, $segmentBytesSource)) {
     if (-not (Test-Path (Join-Path $sourcePath "pyproject.toml") -PathType Leaf)) {
         throw "Required workspace dependency source does not exist: $sourcePath"
     }
@@ -103,11 +104,12 @@ foreach ($runtimeName in $runtimeNames) {
 New-Item -ItemType Directory -Path $wheelRoot, $bundleRoot | Out-Null
 try {
     Write-Output "Building the application wheel..."
-    & $Python -m pip wheel --no-cache-dir --no-deps --wheel-dir $wheelRoot $projectRoot $ecsSource $mtEventsSource
+    & $Python -m pip wheel --no-cache-dir --no-deps --wheel-dir $wheelRoot $projectRoot $ecsSource $mtEventsSource $segmentBytesSource
     Assert-LastExitCode "Release wheel build"
     $applicationWheel = Get-SingleFile $wheelRoot "ipi_euv_acquisition-*.whl" "application wheel"
     $ecsWheel = Get-SingleFile $wheelRoot "ipi_ecs-*.whl" "ECS wheel"
     $mtEventsWheel = Get-SingleFile $wheelRoot "mt_events-*.whl" "mt-events wheel"
+    $segmentBytesWheel = Get-SingleFile $wheelRoot "segment_bytes-*.whl" "segment-bytes wheel"
     if ($applicationWheel.Name -notmatch '^ipi_euv_acquisition-(?<Version>.+)-py3-none-any\.whl$') {
         throw "Unexpected application wheel name: $($applicationWheel.Name)"
     }
@@ -122,6 +124,7 @@ try {
     Copy-Item $applicationWheel.FullName $bundleRoot
     Copy-Item $ecsWheel.FullName $bundleRoot
     Copy-Item $mtEventsWheel.FullName $bundleRoot
+    Copy-Item $segmentBytesWheel.FullName $bundleRoot
     Copy-Item $h5pyWheel.FullName $bundleRoot
     Write-Utf8LfText (Join-Path $bundleRoot "euv-acquisition.service") ([IO.File]::ReadAllText($serviceUnit))
     $bundleRuntimeRoot = Join-Path $bundleRoot "lib"
@@ -136,6 +139,7 @@ try {
         "application_sha256=$applicationHash",
         "ipi_ecs_sha256=$(Get-LowerSha256 -Path $ecsWheel.FullName)",
         "mt_events_sha256=$(Get-LowerSha256 -Path $mtEventsWheel.FullName)",
+        "segment_bytes_sha256=$(Get-LowerSha256 -Path $segmentBytesWheel.FullName)",
         "h5py_sha256=$(Get-LowerSha256 -Path $h5pyWheel.FullName)"
     )
     $releasePath = Join-Path $bundleRoot "RELEASE"
@@ -221,17 +225,21 @@ else
     application_wheel=$(find "$stage" -maxdepth 1 -type f -name 'ipi_euv_acquisition-*.whl' -print -quit)
     ecs_wheel=$(find "$stage" -maxdepth 1 -type f -name 'ipi_ecs-*.whl' -print -quit)
     mt_events_wheel=$(find "$stage" -maxdepth 1 -type f -name 'mt_events-*.whl' -print -quit)
+    segment_bytes_wheel=$(find "$stage" -maxdepth 1 -type f -name 'segment_bytes-*.whl' -print -quit)
     h5py_wheel=$(find "$stage" -maxdepth 1 -type f -name 'h5py-3.11.0-cp310-cp310-linux_armv7l.whl' -print -quit)
     test -n "$application_wheel"
     test -n "$ecs_wheel"
     test -n "$mt_events_wheel"
+    test -n "$segment_bytes_wheel"
     test -n "$h5py_wheel"
-    /usr/bin/python3 -m pip install --no-index --no-deps --target "$temporary_release/python" "$application_wheel" "$ecs_wheel" "$mt_events_wheel" "$h5py_wheel"
+    /usr/bin/python3 -m pip install --no-index --no-deps --target "$temporary_release/python" "$application_wheel" "$ecs_wheel" "$mt_events_wheel" "$segment_bytes_wheel" "$h5py_wheel"
     install -m 0644 "$stage"/lib/*.so.* "$temporary_release/lib/"
 
+    RELEASE_PYTHON_ROOT="$temporary_release/python" \
     PYTHONPATH="$temporary_release/python:/opt/redpitaya/lib/python" \
     LD_LIBRARY_PATH="$temporary_release/lib" \
     /usr/bin/python3 - <<'PY'
+import os
 import pathlib
 import tempfile
 
@@ -239,17 +247,22 @@ import h5py
 import numpy as np
 import rp
 import _rp_py
+import segment_bytes
 from euv_acquisition import red_pitaya_service
 from ipi_ecs.core.tcp import TCPClientSocket
+from ipi_ecs.dds.client import DDSClient
 from ipi_ecs.logging.client import LogClient
 
+release_python_root = pathlib.Path(os.environ["RELEASE_PYTHON_ROOT"]).resolve()
 assert np.__version__ == "2.2.5", np.__version__
 assert h5py.__version__ == "3.11.0", h5py.__version__
 assert h5py.version.hdf5_version == "1.10.7", h5py.version.hdf5_version
 assert pathlib.Path(rp.__file__).resolve().is_relative_to("/opt/redpitaya/lib/python")
 assert pathlib.Path(_rp_py.__file__).resolve().is_relative_to("/opt/redpitaya/lib/python")
+assert pathlib.Path(segment_bytes.__file__).resolve().is_relative_to(release_python_root)
 assert red_pitaya_service._parse_args(["--spool", "/tmp/euv-acquisition-preflight"]).spool == "/tmp/euv-acquisition-preflight"
 assert TCPClientSocket is not None
+assert DDSClient is not None
 assert LogClient is not None
 
 expected = np.arange(12, dtype=np.float32).reshape(3, 4)
