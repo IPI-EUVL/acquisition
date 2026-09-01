@@ -8,10 +8,16 @@ import numpy as np
 import pytest
 
 import euv_acquisition.session as session_module
-from euv_acquisition.models import CaptureConfig, CapturedPulse, SnapshotCloseReason
+from euv_acquisition.models import (
+    CaptureConfig,
+    CapturedPulse,
+    SnapshotCloseReason,
+    SourceBatchEnvelope,
+    SourceCaptureBatch,
+)
 from euv_acquisition.pipeline import CapturePipeline, PipelineConfig
 from euv_acquisition.session import CaptureEngine, CaptureUpdate, RotationConfig, SpoolRepository
-from euv_acquisition.snapshot import SnapshotStore
+from euv_acquisition.snapshot import SnapshotStore, read_snapshot
 from euv_acquisition.sources.isolated import CaptureProcessConfig, IsolatedPulseSource
 
 
@@ -87,6 +93,31 @@ class FailingFencePulseSource:
         return
 
 
+class SingleBatchSource(QueuePulseSource):
+    def __init__(self) -> None:
+        super().__init__(())
+        self.envelope = SourceBatchEnvelope(uuid4(), "test_sequence", 500, 900)
+        self._batch_available = True
+
+    def capture(self) -> SourceCaptureBatch | None:
+        if not self._open:
+            raise RuntimeError("closed")
+        if not self._batch_available:
+            return None
+        self._batch_available = False
+        return SourceCaptureBatch(
+            tuple(
+                CapturedPulse(
+                    np.asarray([0.0, 0.2, 0.2, 0.0], dtype=np.float32),
+                    timestamp,
+                    timestamp,
+                )
+                for timestamp in (600, 700, 800)
+            ),
+            self.envelope,
+        )
+
+
 def _make_pipeline_process_source() -> QueuePulseSource:
     return QueuePulseSource(range(1, 9))
 
@@ -158,6 +189,36 @@ def test_capture_continues_while_persistence_is_blocked_and_stays_ordered(tmp_pa
         assert set(source.owner_threads) == {"euv-capture-producer"}
     finally:
         release_write.set()
+        pipeline.shutdown()
+
+
+def test_source_batch_is_one_snapshot_regardless_of_pulse_rotation(tmp_path) -> None:
+    source = SingleBatchSource()
+    store = SnapshotStore(tmp_path / "spool")
+    spool = SpoolRepository(tmp_path / "spool", server_boot_id=uuid4())
+    engine = CaptureEngine(
+        source,
+        store,
+        spool,
+        source_kind="test_batch",
+        source_id="batch-1",
+        rotation=RotationConfig(pulse_limit=1, wall_time_seconds=0.001, trigger_idle_seconds=0.001),
+    )
+    updates: list[CaptureUpdate] = []
+    pipeline = CapturePipeline(engine, emit_update=updates.append)
+
+    pipeline.start_capture(uuid4())
+    try:
+        _wait_until(lambda: engine.metrics.snapshot()["counters"].get("persisted") == 3)
+        pipeline.stop_capture("batch complete")
+
+        manifests = [manifest for update in updates for manifest in update.closed_snapshots]
+        assert len(manifests) == 1
+        assert manifests[0].close_reason is SnapshotCloseReason.SOURCE_BATCH
+        assert manifests[0].pulse_count == 3
+        assert [update.report.sequence for update in updates if update.report is not None] == [0, 1, 2]
+        assert read_snapshot(store.path_for(manifests[0])).source_batch == source.envelope
+    finally:
         pipeline.shutdown()
 
 

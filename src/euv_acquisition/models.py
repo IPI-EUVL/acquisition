@@ -61,6 +61,7 @@ class CapturedPulse:
     samples_v: np.ndarray
     captured_at_unix_ns: int
     captured_at_monotonic_ns: int
+    native_analysis: NativePulseAnalysis | None = None
 
     def __post_init__(self) -> None:
         samples = np.asarray(self.samples_v)
@@ -76,6 +77,8 @@ class CapturedPulse:
             raise ValueError("captured_at_monotonic_ns must be an integer.")
         if self.captured_at_unix_ns < 0 or self.captured_at_monotonic_ns < 0:
             raise ValueError("Capture timestamps must be non-negative.")
+        if self.native_analysis is not None and not isinstance(self.native_analysis, NativePulseAnalysis):
+            raise ValueError("native_analysis must be NativePulseAnalysis when provided.")
         object.__setattr__(self, "samples_v", np.ascontiguousarray(samples, dtype=np.float32))
 
 
@@ -93,6 +96,21 @@ class NativePulseAnalysis:
     peak_absolute_volts: float
     quality: PulseQuality
     algorithm_version: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.quality, PulseQuality):
+            raise ValueError("Native pulse analysis quality must be PulseQuality.")
+        if not isinstance(self.algorithm_version, str) or not self.algorithm_version:
+            raise ValueError("Native pulse analysis algorithm version cannot be empty.")
+        for name in (
+            "baseline_volts",
+            "integral_volt_seconds",
+            "minimum_volts",
+            "maximum_volts",
+            "peak_absolute_volts",
+        ):
+            if not math.isfinite(float(getattr(self, name))):
+                raise ValueError(f"Native pulse analysis {name} must be finite.")
 
     @classmethod
     def from_dict(cls, value: object) -> "NativePulseAnalysis":
@@ -120,17 +138,6 @@ class NativePulseAnalysis:
             quality=quality,
             algorithm_version=str(value["algorithm_version"]),
         )
-        if not analysis.algorithm_version:
-            raise ValueError("Native pulse analysis algorithm version cannot be empty.")
-        for name in (
-            "baseline_volts",
-            "integral_volt_seconds",
-            "minimum_volts",
-            "maximum_volts",
-            "peak_absolute_volts",
-        ):
-            if not math.isfinite(getattr(analysis, name)):
-                raise ValueError(f"Native pulse analysis {name} must be finite.")
         return analysis
 
 
@@ -161,11 +168,53 @@ class SnapshotCloseReason(str, Enum):
     PULSE_LIMIT = "pulse_limit"
     WALL_TIME = "wall_time"
     TRIGGER_IDLE = "trigger_idle"
+    SOURCE_BATCH = "source_batch"
     EXPLICIT_FLUSH = "explicit_flush"
     CAPTURE_STOP = "capture_stop"
     WATCHDOG = "watchdog"
     DISK_GUARD = "disk_guard"
     ACQUISITION_ERROR = "acquisition_error"
+
+
+@dataclass(frozen=True)
+class SourceBatchEnvelope:
+    batch_id: UUID
+    batch_kind: str
+    capture_started_unix_ns: int
+    capture_completed_unix_ns: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.batch_id, UUID):
+            raise ValueError("Source batch ID must be a UUID.")
+        if not isinstance(self.batch_kind, str) or not self.batch_kind.strip():
+            raise ValueError("Source batch kind cannot be empty.")
+        for name in ("capture_started_unix_ns", "capture_completed_unix_ns"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer.")
+        if self.capture_completed_unix_ns < self.capture_started_unix_ns:
+            raise ValueError("Source batch completion cannot precede its start.")
+
+
+@dataclass(frozen=True)
+class SourceCaptureBatch:
+    pulses: tuple[CapturedPulse, ...]
+    envelope: SourceBatchEnvelope
+
+    def __post_init__(self) -> None:
+        pulses = tuple(self.pulses)
+        if not pulses:
+            raise ValueError("Source capture batch must contain at least one pulse.")
+        if not all(isinstance(pulse, CapturedPulse) for pulse in pulses):
+            raise ValueError("Source capture batch contains an invalid pulse.")
+        for previous, current in zip(pulses, pulses[1:]):
+            if current.captured_at_unix_ns <= previous.captured_at_unix_ns:
+                raise ValueError("Source capture batch Unix timestamps must increase.")
+            if current.captured_at_monotonic_ns <= previous.captured_at_monotonic_ns:
+                raise ValueError("Source capture batch monotonic timestamps must increase.")
+        if not isinstance(self.envelope, SourceBatchEnvelope):
+            raise ValueError("Source capture batch envelope is invalid.")
+        object.__setattr__(self, "pulses", pulses)
 
 
 @dataclass(frozen=True)

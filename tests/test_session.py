@@ -7,7 +7,13 @@ from uuid import uuid4
 import numpy as np
 import pytest
 
-from euv_acquisition.models import CaptureConfig, CapturedPulse, SnapshotCloseReason
+from euv_acquisition.models import (
+    CaptureConfig,
+    CapturedPulse,
+    NativePulseAnalysis,
+    PulseQuality,
+    SnapshotCloseReason,
+)
 from euv_acquisition.session import (
     CaptureEngine,
     CapturePurpose,
@@ -16,7 +22,7 @@ from euv_acquisition.session import (
     RotationConfig,
     SpoolRepository,
 )
-from euv_acquisition.snapshot import SnapshotStore
+from euv_acquisition.snapshot import SnapshotStore, read_snapshot
 
 
 class QueuePulseSource:
@@ -76,6 +82,34 @@ def test_capture_engine_assigns_sequences_and_rotates_at_pulse_limit(tmp_path) -
     assert len(second.closed_snapshots) == 1
     assert second.closed_snapshots[0].close_reason is SnapshotCloseReason.PULSE_LIMIT
     assert spool.load().snapshots[0].manifest == second.closed_snapshots[0]
+
+
+def test_capture_engine_preserves_source_provided_native_analysis(tmp_path) -> None:
+    engine, store, _spool = _engine(tmp_path, timestamps=())
+    engine.start()
+    supplied = NativePulseAnalysis(
+        baseline_volts=0.125,
+        integral_volt_seconds=1.234567890123456e-9,
+        minimum_volts=0.0,
+        maximum_volts=0.2,
+        peak_absolute_volts=0.2,
+        quality=PulseQuality.OK,
+        algorithm_version="siglent-legacy-integral-v1",
+    )
+    pulse = CapturedPulse(
+        np.asarray([0.0, 0.2, 0.2, 0.0], dtype=np.float64),
+        1,
+        1,
+        native_analysis=supplied,
+    )
+
+    processed = engine.process_accepted(engine.accept_pulse(pulse))
+    manifest = engine.flush().closed_snapshots[0]
+    contents = read_snapshot(store.path_for(manifest))
+
+    assert processed.report.analysis == supplied
+    assert contents.native_analysis_version == supplied.algorithm_version
+    assert contents.integral_volt_seconds[0] == supplied.integral_volt_seconds
 
 
 def test_capture_engine_rotates_nonempty_snapshot_on_idle_tick(tmp_path) -> None:

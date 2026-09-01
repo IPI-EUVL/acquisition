@@ -13,7 +13,13 @@ from typing import Any
 
 import numpy as np
 
-from euv_acquisition.models import CaptureConfig, CapturedPulse
+from euv_acquisition.models import (
+    CaptureConfig,
+    CapturedPulse,
+    NativePulseAnalysis,
+    SourceBatchEnvelope,
+    SourceCaptureBatch,
+)
 from euv_acquisition.pipeline_metrics import PipelineMetrics
 from euv_acquisition.sources.base import PulseSource
 
@@ -77,6 +83,14 @@ class _WorkerPulse:
     samples: bytes
     captured_at_unix_ns: int
     captured_at_monotonic_ns: int
+    durations: tuple[tuple[str, int], ...]
+    native_analysis: NativePulseAnalysis | None = None
+
+
+@dataclass(frozen=True)
+class _WorkerSourceBatch:
+    pulses: tuple[_WorkerPulse, ...]
+    envelope: SourceBatchEnvelope
     durations: tuple[tuple[str, int], ...]
 
 
@@ -193,16 +207,34 @@ def _capture_worker(
             while command_connection.poll():
                 token = command_connection.recv()
                 outbox.put(_WorkerFence(token), timeout=config.queue_timeout_seconds)
-            pulse = source.capture()
-            if pulse is None:
+            captured = source.capture()
+            if captured is None:
                 stop_event.wait(config.poll_seconds)
                 continue
-            message = _WorkerPulse(
-                samples=pulse.samples_v.tobytes(order="C"),
-                captured_at_unix_ns=pulse.captured_at_unix_ns,
-                captured_at_monotonic_ns=pulse.captured_at_monotonic_ns,
-                durations=metrics.take_durations(),
-            )
+            durations = metrics.take_durations()
+            if isinstance(captured, SourceCaptureBatch):
+                message = _WorkerSourceBatch(
+                    pulses=tuple(
+                        _WorkerPulse(
+                            samples=pulse.samples_v.tobytes(order="C"),
+                            captured_at_unix_ns=pulse.captured_at_unix_ns,
+                            captured_at_monotonic_ns=pulse.captured_at_monotonic_ns,
+                            durations=(),
+                            native_analysis=pulse.native_analysis,
+                        )
+                        for pulse in captured.pulses
+                    ),
+                    envelope=captured.envelope,
+                    durations=durations,
+                )
+            else:
+                message = _WorkerPulse(
+                    samples=captured.samples_v.tobytes(order="C"),
+                    captured_at_unix_ns=captured.captured_at_unix_ns,
+                    captured_at_monotonic_ns=captured.captured_at_monotonic_ns,
+                    durations=durations,
+                    native_analysis=captured.native_analysis,
+                )
             try:
                 outbox.put(message, timeout=config.queue_timeout_seconds)
             except queue.Full as exc:
@@ -284,7 +316,7 @@ class IsolatedPulseSource:
         self._status_connection = None
         self._command_connection = None
         self._stop_event = None
-        self._pending_pulses: deque[_WorkerPulse] = deque()
+        self._pending_captures: deque[_WorkerPulse | _WorkerSourceBatch] = deque()
         self._deferred_failure: str | None = None
         self._next_fence_token = 0
         self._ipc_overflow_recorded = False
@@ -349,7 +381,7 @@ class IsolatedPulseSource:
         if self._state != "stopped":
             raise RuntimeError("Isolated pulse source is already open.")
         self._state = "starting"
-        self._pending_pulses.clear()
+        self._pending_captures.clear()
         self._deferred_failure = None
         self._ipc_overflow_recorded = False
         self._stop_event = self._context.Event()
@@ -400,7 +432,7 @@ class IsolatedPulseSource:
             self._state = "failed" if self._unusable else "stopped"
             raise
 
-    def capture(self) -> CapturedPulse | None:
+    def capture(self) -> CapturedPulse | SourceCaptureBatch | None:
         if self._state != "running":
             raise RuntimeError("Isolated pulse source is not open.")
         message = self._take_outbox_message()
@@ -410,41 +442,54 @@ class IsolatedPulseSource:
         if message is None:
             self._raise_finished_worker_failure()
             return None
-        if not isinstance(message, _WorkerPulse):
+        if not isinstance(message, (_WorkerPulse, _WorkerSourceBatch)):
             raise RuntimeError(f"Capture worker returned unexpected pulse message {type(message).__name__}.")
-        return self._decode_pulse(message)
+        return self._decode_capture(message)
 
-    def capture_fence(self) -> tuple[CapturedPulse, ...]:
+    def capture_fence(self) -> tuple[CapturedPulse | SourceCaptureBatch, ...]:
         if self._state != "running":
             raise RuntimeError("Isolated pulse source is not open.")
         self._next_fence_token += 1
         token = self._next_fence_token
         self._command_connection.send(token)
-        pulse_messages: list[_WorkerPulse] = []
+        capture_messages: list[_WorkerPulse | _WorkerSourceBatch] = []
         deadline = time.monotonic() + self._process_config.shutdown_timeout_seconds
         try:
             while time.monotonic() < deadline:
                 message = self._take_outbox_message(timeout=min(0.05, deadline - time.monotonic()))
-                if isinstance(message, _WorkerPulse):
-                    pulse_messages.append(message)
+                if isinstance(message, (_WorkerPulse, _WorkerSourceBatch)):
+                    capture_messages.append(message)
                     continue
                 if isinstance(message, _WorkerFence):
                     if message.token != token:
                         raise RuntimeError(
                             f"Capture worker returned fence {message.token}; expected {token}."
                         )
-                    return tuple(self._decode_pulse(message) for message in pulse_messages)
+                    return tuple(self._decode_capture(message) for message in capture_messages)
                 self._collect_worker_status()
                 self._raise_finished_worker_failure()
             raise TimeoutError("Capture worker did not publish a flush fence before its deadline.")
         except BaseException:
-            self._pending_pulses.extend(pulse_messages)
+            self._pending_captures.extend(capture_messages)
             raise
 
-    def drain_captured(self) -> tuple[CapturedPulse, ...]:
-        pulses = tuple(self._decode_pulse(message) for message in self._pending_pulses)
-        self._pending_pulses.clear()
-        return pulses
+    def drain_captured(self) -> tuple[CapturedPulse | SourceCaptureBatch, ...]:
+        captures = tuple(self._decode_capture(message) for message in self._pending_captures)
+        self._pending_captures.clear()
+        return captures
+
+    def _decode_capture(
+        self,
+        message: _WorkerPulse | _WorkerSourceBatch,
+    ) -> CapturedPulse | SourceCaptureBatch:
+        if isinstance(message, _WorkerPulse):
+            return self._decode_pulse(message)
+        for stage, duration_ns in message.durations:
+            self._metrics.record_duration(stage, duration_ns)
+        return SourceCaptureBatch(
+            tuple(self._decode_pulse(pulse) for pulse in message.pulses),
+            message.envelope,
+        )
 
     def _decode_pulse(self, message: _WorkerPulse) -> CapturedPulse:
         expected_bytes = self._capture_config.window_samples * np.dtype(np.float32).itemsize
@@ -458,6 +503,7 @@ class IsolatedPulseSource:
             samples_v=np.frombuffer(message.samples, dtype=np.float32),
             captured_at_unix_ns=message.captured_at_unix_ns,
             captured_at_monotonic_ns=message.captured_at_monotonic_ns,
+            native_analysis=message.native_analysis,
         )
 
     def close(self) -> None:
@@ -542,8 +588,8 @@ class IsolatedPulseSource:
             message = self._take_outbox_message()
             if message is None:
                 return
-            if isinstance(message, _WorkerPulse):
-                self._pending_pulses.append(message)
+            if isinstance(message, (_WorkerPulse, _WorkerSourceBatch)):
+                self._pending_captures.append(message)
             else:
                 self._deferred_failure = (
                     f"Capture worker returned unexpected drain message {type(message).__name__}."

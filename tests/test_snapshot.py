@@ -7,7 +7,7 @@ import pytest
 
 import euv_acquisition.snapshot as snapshot_module
 from euv_acquisition.analysis import analyze_pulse
-from euv_acquisition.models import CaptureConfig, CapturedPulse, PulseRecord, SnapshotCloseReason
+from euv_acquisition.models import CaptureConfig, CapturedPulse, PulseRecord, SnapshotCloseReason, SourceBatchEnvelope
 from euv_acquisition.snapshot import SnapshotManifest, SnapshotStore, read_snapshot
 
 
@@ -44,9 +44,36 @@ def test_snapshot_store_writes_uncompressed_atomic_hdf5_and_round_trips(tmp_path
     assert contents.samples_v.dtype == np.float32
     assert contents.sequence.tolist() == [10, 11, 12]
     assert contents.source_kind == "simulated"
+    assert contents.native_analysis_version == records[0].analysis.algorithm_version
+    assert contents.source_batch is None
     assert list(tmp_path.glob("*.tmp")) == []
     with h5py.File(path, "r") as snapshot:
         assert all(dataset.compression is None for dataset in snapshot.values())
+
+
+def test_snapshot_store_round_trips_source_batch_envelope(tmp_path) -> None:
+    config, records = _records()
+    store = SnapshotStore(tmp_path)
+    envelope = SourceBatchEnvelope(
+        batch_id=uuid4(),
+        batch_kind="siglent_sequence",
+        capture_started_unix_ns=1_000,
+        capture_completed_unix_ns=2_000,
+    )
+
+    manifest = store.write(
+        records,
+        config,
+        SnapshotCloseReason.SOURCE_BATCH,
+        source_kind="siglent",
+        source_id="scope-1",
+        source_batch=envelope,
+    )
+
+    contents = read_snapshot(store.path_for(manifest))
+    store.verify(manifest)
+    assert contents.close_reason is SnapshotCloseReason.SOURCE_BATCH
+    assert contents.source_batch == envelope
 
 
 def test_snapshot_manifest_is_strict_and_round_trips(tmp_path) -> None:

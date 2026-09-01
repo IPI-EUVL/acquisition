@@ -7,6 +7,8 @@ from euv_acquisition.models import (
     PulseReport,
     PulseQuality,
     SnapshotCloseReason,
+    SourceBatchEnvelope,
+    SourceCaptureBatch,
 )
 
 __all__ = [
@@ -18,5 +20,7 @@ __all__ = [
     "PulseReport",
     "PulseQuality",
     "SnapshotCloseReason",
+    "SourceBatchEnvelope",
+    "SourceCaptureBatch",
     "analyze_pulse",
 ]

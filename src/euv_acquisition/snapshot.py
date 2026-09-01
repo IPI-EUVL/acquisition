@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 import h5py
 import numpy as np
 
-from euv_acquisition.models import CaptureConfig, PulseRecord, SnapshotCloseReason
+from euv_acquisition.models import CaptureConfig, PulseRecord, SnapshotCloseReason, SourceBatchEnvelope
 
 
 SNAPSHOT_SCHEMA_VERSION = 1
@@ -121,6 +121,8 @@ class SnapshotContents:
     maximum_volts: np.ndarray
     peak_absolute_volts: np.ndarray
     quality: np.ndarray
+    native_analysis_version: str
+    source_batch: SourceBatchEnvelope | None
 
 
 class SnapshotStore:
@@ -135,6 +137,7 @@ class SnapshotStore:
             raise ValueError("Cannot write an empty snapshot.")
         session_id = normalized[0].session_id
         first_sequence = normalized[0].sequence
+        analysis_version = normalized[0].analysis.algorithm_version
         for offset, record in enumerate(normalized):
             if record.session_id != session_id:
                 raise ValueError("Snapshot pulses must belong to one capture session.")
@@ -142,6 +145,8 @@ class SnapshotStore:
                 raise ValueError("Snapshot pulse sequences must be contiguous and ordered.")
             if len(record.pulse.samples_v) != capture_config.window_samples:
                 raise ValueError("Snapshot pulse sample count does not match capture configuration.")
+            if record.analysis.algorithm_version != analysis_version:
+                raise ValueError("Snapshot pulses must use one native analysis version.")
         return normalized
 
     def write(
@@ -152,10 +157,15 @@ class SnapshotStore:
         *,
         source_kind: str,
         source_id: str,
+        source_batch: SourceBatchEnvelope | None = None,
     ) -> SnapshotManifest:
         normalized = self._validate_records(records, capture_config)
         if not source_kind.strip() or not source_id.strip():
             raise ValueError("Snapshot source kind and source ID cannot be empty.")
+        if close_reason is SnapshotCloseReason.SOURCE_BATCH and source_batch is None:
+            raise ValueError("Source-batch snapshots require a source batch envelope.")
+        if close_reason is not SnapshotCloseReason.SOURCE_BATCH and source_batch is not None:
+            raise ValueError("Source batch envelopes require the source_batch close reason.")
 
         snapshot_id = uuid4()
         filename = f"snap_{snapshot_id}.h5"
@@ -178,6 +188,11 @@ class SnapshotStore:
                 snapshot.attrs["input_full_scale_volts"] = capture_config.input_full_scale_volts
                 snapshot.attrs["clipping_fraction"] = capture_config.clipping_fraction
                 snapshot.attrs["native_analysis_version"] = first.analysis.algorithm_version
+                if source_batch is not None:
+                    snapshot.attrs["capture_batch_id"] = str(source_batch.batch_id)
+                    snapshot.attrs["capture_batch_kind"] = source_batch.batch_kind
+                    snapshot.attrs["capture_started_unix_ns"] = source_batch.capture_started_unix_ns
+                    snapshot.attrs["capture_completed_unix_ns"] = source_batch.capture_completed_unix_ns
 
                 snapshot.create_dataset("samples_v", data=np.stack([item.pulse.samples_v for item in normalized]))
                 snapshot.create_dataset("sequence", data=np.asarray([item.sequence for item in normalized], dtype=np.uint64))
@@ -304,13 +319,40 @@ def read_snapshot(path: str | Path) -> SnapshotContents:
         if samples.shape[1] != capture_config.window_samples:
             raise ValueError("HDF5 sample shape does not match capture configuration.")
 
+        native_analysis_version = str(snapshot.attrs.get("native_analysis_version", ""))
+        if not native_analysis_version:
+            raise ValueError("HDF5 snapshot native analysis version cannot be empty.")
+        batch_attributes = {
+            "capture_batch_id",
+            "capture_batch_kind",
+            "capture_started_unix_ns",
+            "capture_completed_unix_ns",
+        }
+        present_batch_attributes = batch_attributes.intersection(snapshot.attrs)
+        if present_batch_attributes and present_batch_attributes != batch_attributes:
+            raise ValueError("HDF5 source batch envelope is incomplete.")
+        source_batch = None
+        if present_batch_attributes:
+            try:
+                source_batch = SourceBatchEnvelope(
+                    batch_id=UUID(str(snapshot.attrs["capture_batch_id"])),
+                    batch_kind=str(snapshot.attrs["capture_batch_kind"]),
+                    capture_started_unix_ns=int(snapshot.attrs["capture_started_unix_ns"]),
+                    capture_completed_unix_ns=int(snapshot.attrs["capture_completed_unix_ns"]),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("HDF5 source batch envelope is invalid.") from exc
+        close_reason = SnapshotCloseReason(str(snapshot.attrs["close_reason"]))
+        if (close_reason is SnapshotCloseReason.SOURCE_BATCH) != (source_batch is not None):
+            raise ValueError("HDF5 source batch envelope does not match its close reason.")
+
         return SnapshotContents(
             snapshot_id=UUID(str(snapshot.attrs["snapshot_id"])),
             session_id=UUID(str(snapshot.attrs["session_id"])),
             capture_config=capture_config,
             source_kind=str(snapshot.attrs["source_kind"]),
             source_id=str(snapshot.attrs["source_id"]),
-            close_reason=SnapshotCloseReason(str(snapshot.attrs["close_reason"])),
+            close_reason=close_reason,
             samples_v=samples,
             sequence=sequence,
             captured_at_unix_ns=arrays["captured_at_unix_ns"],
@@ -321,4 +363,6 @@ def read_snapshot(path: str | Path) -> SnapshotContents:
             maximum_volts=arrays["maximum_volts"],
             peak_absolute_volts=arrays["peak_absolute_volts"],
             quality=arrays["quality"],
+            native_analysis_version=native_analysis_version,
+            source_batch=source_batch,
         )

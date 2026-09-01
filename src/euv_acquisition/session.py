@@ -13,7 +13,15 @@ from typing import Callable
 from uuid import UUID, uuid4
 
 from euv_acquisition.analysis import analyze_pulse
-from euv_acquisition.models import CapturedPulse, PulseQuality, PulseRecord, PulseReport, SnapshotCloseReason
+from euv_acquisition.models import (
+    CapturedPulse,
+    PulseQuality,
+    PulseRecord,
+    PulseReport,
+    SnapshotCloseReason,
+    SourceBatchEnvelope,
+    SourceCaptureBatch,
+)
 from euv_acquisition.pipeline_metrics import PipelineMetrics
 from euv_acquisition.snapshot import SNAPSHOT_SCHEMA_VERSION, SnapshotManifest, SnapshotStore
 from euv_acquisition.sources.base import PulseSource
@@ -333,15 +341,33 @@ class AcceptedPulse:
 
 
 @dataclass(frozen=True)
+class AcceptedSourceBatch:
+    pulses: tuple[AcceptedPulse, ...]
+    envelope: SourceBatchEnvelope
+
+
+@dataclass(frozen=True)
 class SnapshotBatch:
     records: tuple[PulseRecord, ...]
     close_reason: SnapshotCloseReason
+    source_batch: SourceBatchEnvelope | None = None
+
+    def __post_init__(self) -> None:
+        if (self.close_reason is SnapshotCloseReason.SOURCE_BATCH) != (self.source_batch is not None):
+            raise ValueError("Snapshot source batch envelope does not match its close reason.")
 
 
 @dataclass(frozen=True)
 class PulseProcessingResult:
     report: PulseReport
     closed_batches: tuple[SnapshotBatch, ...] = ()
+    stop_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class SourceBatchProcessingResult:
+    reports: tuple[PulseReport, ...]
+    closed_batch: SnapshotBatch
     stop_reason: str | None = None
 
 
@@ -449,10 +475,37 @@ class CaptureEngine:
                 samples_v=pulse.samples_v.copy(),
                 captured_at_unix_ns=pulse.captured_at_unix_ns,
                 captured_at_monotonic_ns=pulse.captured_at_monotonic_ns,
+                native_analysis=pulse.native_analysis,
             )
             accepted = AcceptedPulse(self._next_sequence, owned_pulse)
             self._next_sequence += 1
             self.metrics.increment("accepted")
+            return accepted
+
+    def accept_source_batch(self, batch: SourceCaptureBatch) -> AcceptedSourceBatch:
+        with self._lock:
+            self._require_active()
+            owned_pulses = []
+            for pulse in batch.pulses:
+                if len(pulse.samples_v) != self.source.capture_config.window_samples:
+                    raise ValueError("Pulse source returned the wrong sample count.")
+                owned_pulses.append(
+                    CapturedPulse(
+                        samples_v=pulse.samples_v.copy(),
+                        captured_at_unix_ns=pulse.captured_at_unix_ns,
+                        captured_at_monotonic_ns=pulse.captured_at_monotonic_ns,
+                        native_analysis=pulse.native_analysis,
+                    )
+                )
+            accepted = AcceptedSourceBatch(
+                tuple(
+                    AcceptedPulse(self._next_sequence + offset, pulse)
+                    for offset, pulse in enumerate(owned_pulses)
+                ),
+                batch.envelope,
+            )
+            self._next_sequence += len(accepted.pulses)
+            self.metrics.increment("accepted", len(accepted.pulses))
             return accepted
 
     def process_accepted(self, accepted: AcceptedPulse) -> PulseProcessingResult:
@@ -463,7 +516,9 @@ class CaptureEngine:
                     f"Expected accepted pulse sequence {self._next_analysis_sequence}, got {accepted.sequence}."
                 )
             analysis_started_ns = self._monotonic_time_ns()
-            analysis = analyze_pulse(accepted.pulse.samples_v, self.source.capture_config)
+            analysis = accepted.pulse.native_analysis
+            if analysis is None:
+                analysis = analyze_pulse(accepted.pulse.samples_v, self.source.capture_config)
             self.metrics.record_duration("analysis", self._monotonic_time_ns() - analysis_started_ns)
             self.metrics.increment("analyzed")
             record = PulseRecord(self._session_id, accepted.sequence, accepted.pulse, analysis)
@@ -486,6 +541,60 @@ class CaptureEngine:
                 )
 
             return PulseProcessingResult(PulseReport.from_record(record), tuple(closed), stop_reason)
+
+    def process_accepted_source_batch(
+        self,
+        accepted: AcceptedSourceBatch,
+    ) -> SourceBatchProcessingResult:
+        with self._lock:
+            self._require_active()
+            if self._pending:
+                raise RuntimeError("Source capture batch cannot be merged with pending pulses.")
+            if not accepted.pulses:
+                raise ValueError("Accepted source batch cannot be empty.")
+            expected_sequences = range(
+                self._next_analysis_sequence,
+                self._next_analysis_sequence + len(accepted.pulses),
+            )
+            if any(item.sequence != expected for item, expected in zip(accepted.pulses, expected_sequences)):
+                raise ValueError("Accepted source batch pulse sequences are not contiguous.")
+
+            records = []
+            analysis_duration_ns = 0
+            for item in accepted.pulses:
+                analysis_started_ns = self._monotonic_time_ns()
+                analysis = item.pulse.native_analysis
+                if analysis is None:
+                    analysis = analyze_pulse(item.pulse.samples_v, self.source.capture_config)
+                analysis_duration_ns += self._monotonic_time_ns() - analysis_started_ns
+                records.append(PulseRecord(self._session_id, item.sequence, item.pulse, analysis))
+            if len({record.analysis.algorithm_version for record in records}) != 1:
+                raise ValueError("Source capture batch must use one native analysis version.")
+
+            self.metrics.record_duration("analysis", analysis_duration_ns)
+            self.metrics.increment("analyzed", len(records))
+            self._next_analysis_sequence += len(records)
+            self._pending.extend(records)
+            self._clipping_window.extend(
+                bool(record.analysis.quality & PulseQuality.CLIPPED) for record in records
+            )
+            closed_batch = self._take_batch_locked(
+                SnapshotCloseReason.SOURCE_BATCH,
+                accepted.envelope,
+            )
+
+            stop_reason = None
+            if not self._terminal_requested and sum(self._clipping_window) >= self.rotation.clipped_pulse_limit:
+                self._terminal_requested = True
+                stop_reason = (
+                    f"Clipping limit reached: {sum(self._clipping_window)} clipped pulse(s) "
+                    f"in the last {len(self._clipping_window)} pulse(s)."
+                )
+            return SourceBatchProcessingResult(
+                tuple(PulseReport.from_record(record) for record in records),
+                closed_batch,
+                stop_reason,
+            )
 
     def take_due_batch(self, now_monotonic_ns: int | None = None) -> SnapshotBatch | None:
         with self._lock:
@@ -519,6 +628,7 @@ class CaptureEngine:
             batch.close_reason,
             source_kind=self.source_kind,
             source_id=self.source_id,
+            source_batch=batch.source_batch,
         )
         self.spool.add_snapshot(manifest)
         self.metrics.record_duration("snapshot_write", self._monotonic_time_ns() - started_ns)
@@ -544,6 +654,21 @@ class CaptureEngine:
             if pulse is None:
                 return self.tick()
             try:
+                if isinstance(pulse, SourceCaptureBatch):
+                    accepted_batch = self.accept_source_batch(pulse)
+                    processed_batch = self.process_accepted_source_batch(accepted_batch)
+                    manifest = self.persist_batch(processed_batch.closed_batch)
+                    if processed_batch.stop_reason is not None:
+                        self.source.close()
+                        self.finalize_session(
+                            processed_batch.stop_reason,
+                            terminal_error=processed_batch.stop_reason,
+                        )
+                    return CaptureUpdate(
+                        processed_batch.reports[-1],
+                        (manifest,),
+                        processed_batch.stop_reason,
+                    )
                 accepted = self.accept_pulse(pulse)
             except ValueError:
                 return self._stop_for_error("Pulse source returned the wrong sample count.")
@@ -595,8 +720,12 @@ class CaptureEngine:
         self.finalize_session(reason, terminal_error=reason)
         return CaptureUpdate(closed_snapshots=closed, stop_reason=reason)
 
-    def _take_batch_locked(self, close_reason: SnapshotCloseReason) -> SnapshotBatch:
-        batch = SnapshotBatch(tuple(self._pending), close_reason)
+    def _take_batch_locked(
+        self,
+        close_reason: SnapshotCloseReason,
+        source_batch: SourceBatchEnvelope | None = None,
+    ) -> SnapshotBatch:
+        batch = SnapshotBatch(tuple(self._pending), close_reason, source_batch)
         self._pending.clear()
         return batch
 

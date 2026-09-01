@@ -2,11 +2,19 @@ import os
 import queue
 import threading
 import time
+from uuid import uuid4
 
 import numpy as np
 import pytest
 
-from euv_acquisition.models import CaptureConfig, CapturedPulse
+from euv_acquisition.models import (
+    CaptureConfig,
+    CapturedPulse,
+    NativePulseAnalysis,
+    PulseQuality,
+    SourceBatchEnvelope,
+    SourceCaptureBatch,
+)
 from euv_acquisition.sources.isolated import (
     CaptureProcessConfig,
     IsolatedPulseSource,
@@ -105,6 +113,34 @@ class _CloseFailureSource(_ProcessTestSource):
         raise RuntimeError("release confirmation fixture")
 
 
+class _BatchProcessTestSource(_ProcessTestSource):
+    def capture(self) -> SourceCaptureBatch | None:
+        if self._sequence:
+            return None
+        self._sequence = 1
+        analysis = NativePulseAnalysis(
+            baseline_volts=0.0,
+            integral_volt_seconds=1.234567890123456e-9,
+            minimum_volts=0.0,
+            maximum_volts=0.3,
+            peak_absolute_volts=0.3,
+            quality=PulseQuality.OK,
+            algorithm_version="source-batch-test-v1",
+        )
+        return SourceCaptureBatch(
+            tuple(
+                CapturedPulse(
+                    np.asarray([0.0, 0.1, 0.2, 0.3], dtype=np.float64),
+                    timestamp,
+                    timestamp + 1_000,
+                    native_analysis=analysis,
+                )
+                for timestamp in (100, 200)
+            ),
+            SourceBatchEnvelope(uuid4(), "test_sequence", 50, 250),
+        )
+
+
 def _make_process_test_source() -> _ProcessTestSource:
     return _ProcessTestSource()
 
@@ -127,6 +163,10 @@ def _make_burst_process_test_source() -> _BurstProcessTestSource:
 
 def _make_close_failure_source() -> _CloseFailureSource:
     return _CloseFailureSource()
+
+
+def _make_batch_process_test_source() -> _BatchProcessTestSource:
+    return _BatchProcessTestSource()
 
 
 def _process_config() -> CaptureProcessConfig:
@@ -172,6 +212,32 @@ def test_isolated_source_captures_in_spawned_process_and_forwards_metrics() -> N
         np.asarray([1.0, 0.1, 0.2, 0.3], dtype=np.float32),
     )
     assert source._metrics.snapshot()["stages"]["hardware_read"]["count"] == 2
+
+
+def test_isolated_source_preserves_atomic_source_batch() -> None:
+    config = CaptureConfig(sample_rate_hz=1_000_000.0, window_seconds=4e-6, pretrigger_seconds=1e-6)
+    source = IsolatedPulseSource(
+        _make_batch_process_test_source,
+        config,
+        requested_capture_mode="test-batch",
+        process_config=_process_config(),
+    )
+
+    source.open()
+    captured = None
+    try:
+        deadline = time.monotonic() + 5.0
+        while captured is None and time.monotonic() < deadline:
+            captured = source.capture()
+            if captured is None:
+                time.sleep(0.001)
+    finally:
+        source.close()
+
+    assert isinstance(captured, SourceCaptureBatch)
+    assert captured.envelope.batch_kind == "test_sequence"
+    assert [pulse.captured_at_unix_ns for pulse in captured.pulses] == [100, 200]
+    assert captured.pulses[0].native_analysis.integral_volt_seconds == 1.234567890123456e-9
 
 
 def test_isolated_source_reports_capture_worker_failure() -> None:

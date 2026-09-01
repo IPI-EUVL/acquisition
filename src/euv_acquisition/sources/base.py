@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from euv_acquisition.models import CaptureConfig, CapturedPulse
+from euv_acquisition.models import CaptureConfig, CapturedPulse, SourceCaptureBatch
 
 
 class PulseSource(Protocol):
@@ -11,6 +11,6 @@ class PulseSource(Protocol):
 
     def open(self) -> None: ...
 
-    def capture(self) -> CapturedPulse | None: ...
+    def capture(self) -> CapturedPulse | SourceCaptureBatch | None: ...
 
     def close(self) -> None: ...

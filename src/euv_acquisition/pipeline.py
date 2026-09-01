@@ -8,9 +8,10 @@ from dataclasses import dataclass, field
 from typing import Callable
 from uuid import UUID
 
-from euv_acquisition.models import SnapshotCloseReason
+from euv_acquisition.models import SnapshotCloseReason, SourceCaptureBatch
 from euv_acquisition.session import (
     AcceptedPulse,
+    AcceptedSourceBatch,
     CaptureEngine,
     CapturePurpose,
     CaptureUpdate,
@@ -45,6 +46,12 @@ class PipelineConfig:
 @dataclass(frozen=True)
 class _AcceptedWork:
     accepted: AcceptedPulse
+    enqueued_at_monotonic_ns: int
+
+
+@dataclass(frozen=True)
+class _AcceptedSourceBatchWork:
+    accepted: AcceptedSourceBatch
     enqueued_at_monotonic_ns: int
 
 
@@ -84,7 +91,7 @@ class _PersistenceTerminal:
     terminal_error: str | None
 
 
-_RawWork = _AcceptedWork | _FlushFence | _TerminalFence
+_RawWork = _AcceptedWork | _AcceptedSourceBatchWork | _FlushFence | _TerminalFence
 _PersistenceWork = _PersistenceBatch | _PersistenceFence | _PersistenceTerminal
 
 
@@ -261,7 +268,7 @@ class CapturePipeline:
                 if pulse is None:
                     self._stop_requested.wait(self.config.capture_poll_seconds)
                     continue
-                if not self._accept_captured_pulse(pulse, block=False):
+                if not self._accept_captured(pulse, block=False):
                     break
         finally:
             self._publish_flush_requests(source_open=source_open)
@@ -275,7 +282,7 @@ class CapturePipeline:
                 if drain_captured is not None:
                     try:
                         for pulse in drain_captured():
-                            if not self._accept_captured_pulse(pulse, block=True):
+                            if not self._accept_captured(pulse, block=True):
                                 break
                     except Exception as exc:
                         reason = f"Pulse source drain failure: {type(exc).__name__}: {exc}"
@@ -326,6 +333,36 @@ class CapturePipeline:
                         analysis_error = exc
                         self.engine.metrics.increment("analysis_failures")
                         self.engine.metrics.increment("unprocessed_after_analysis_failure")
+                        reason = f"Analysis stage failure: {type(exc).__name__}: {exc}"
+                        self._request_terminal(reason, terminal_error=reason)
+                elif isinstance(work, _AcceptedSourceBatchWork):
+                    if analysis_error is not None:
+                        self.engine.metrics.increment(
+                            "unprocessed_after_analysis_failure",
+                            len(work.accepted.pulses),
+                        )
+                        continue
+                    self.engine.metrics.record_duration(
+                        "capture_queue_wait",
+                        self._monotonic_time_ns() - work.enqueued_at_monotonic_ns,
+                    )
+                    try:
+                        processed = self.engine.process_accepted_source_batch(work.accepted)
+                        for report in processed.reports:
+                            self._emit_update(CaptureUpdate(report=report))
+                        self._queue_persistence_batch(processed.closed_batch)
+                        if processed.stop_reason is not None:
+                            self._request_terminal(
+                                processed.stop_reason,
+                                terminal_error=processed.stop_reason,
+                            )
+                    except Exception as exc:
+                        analysis_error = exc
+                        self.engine.metrics.increment("analysis_failures")
+                        self.engine.metrics.increment(
+                            "unprocessed_after_analysis_failure",
+                            len(work.accepted.pulses),
+                        )
                         reason = f"Analysis stage failure: {type(exc).__name__}: {exc}"
                         self._request_terminal(reason, terminal_error=reason)
                 elif isinstance(work, _FlushFence):
@@ -425,7 +462,7 @@ class CapturePipeline:
             if source_open and capture_fence is not None:
                 try:
                     for pulse in capture_fence():
-                        if not self._accept_captured_pulse(pulse, block=True):
+                        if not self._accept_captured(pulse, block=True):
                             break
                 except Exception as exc:
                     request.completion.error = exc
@@ -433,7 +470,7 @@ class CapturePipeline:
                     if drain_captured is not None:
                         try:
                             for pulse in drain_captured():
-                                if not self._accept_captured_pulse(pulse, block=True):
+                                if not self._accept_captured(pulse, block=True):
                                     break
                         except Exception as drain_exc:
                             request.completion.error = drain_exc
@@ -442,14 +479,18 @@ class CapturePipeline:
             self._capture_queue.put(request)
             self._observe_capture_queue()
 
-    def _accept_captured_pulse(self, pulse, *, block: bool) -> bool:
+    def _accept_captured(self, pulse, *, block: bool) -> bool:
         try:
-            accepted = self.engine.accept_pulse(pulse)
+            if isinstance(pulse, SourceCaptureBatch):
+                accepted = self.engine.accept_source_batch(pulse)
+                work = _AcceptedSourceBatchWork(accepted, self._monotonic_time_ns())
+            else:
+                accepted = self.engine.accept_pulse(pulse)
+                work = _AcceptedWork(accepted, self._monotonic_time_ns())
         except Exception as exc:
             reason = f"Pulse acceptance failure: {type(exc).__name__}: {exc}"
             self._request_terminal(reason, terminal_error=reason)
             return False
-        work = _AcceptedWork(accepted, self._monotonic_time_ns())
         if block:
             self._capture_queue.put(work)
         else:
