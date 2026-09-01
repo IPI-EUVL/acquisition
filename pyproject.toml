@@ -13,6 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 storage = ["h5py>=3.11"]
+siglent = ["pyvisa>=1.16", "pyvisa-py>=0.7"]
 simulator-dds = ["ipi-ecs>=0.1.0"]
 ecs-log = ["ipi-ecs>=0.1.7"]
 dev = [
@@ -23,6 +24,8 @@ dev = [
 [project.scripts]
 euv-acquisition-sim = "euv_acquisition.simulator_service:main"
 euv-acquisition-red-pitaya = "euv_acquisition.red_pitaya_service:main"
+euv-acquisition-siglent = "euv_acquisition.siglent_service:main"
+euv-acquisition-siglent-sim = "euv_acquisition.siglent_simulator_service:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -16,11 +16,68 @@ The simulator opens a small control window by default. Use it to turn the simula
 
 The simulator follows the chamber's versioned laser timing state by default and fails closed before the first timing update. It uses `ECS_HOST` or `127.0.0.1` for DDS, and defaults to the chamber Laser Sync Controller UUID. `--dds-host` and `--laser-subsystem-uuid` override those values. Use `--standalone-timing` only for isolated simulator tests that should continuously model a nominal transmitting laser. Manual controls remain fault-injection overrides in either mode.
 
+This simulator models the authoritative pulse digitizer. Use the separate
+Siglent simulator below to exercise `chamber-siglent-recorder`.
+
 When the simulator runs headless on the Red Pitaya, chamber control can operate its laser, chopper, and PLL fault gates through the acquisition controller's DDS interface. The simulator advertises this capability in acquisition status; the hardware service does not, so simulator-control commands fail closed against the physical ADC source.
 
 Capture sessions are tagged as `experiment` or `diagnostic`. Experiment artifacts retain the existing acknowledge-then-release lifecycle. Diagnostic clients may purge each verified, acknowledged snapshot immediately and may discard only a stopped diagnostic session; these commands reject experiment sessions so test cleanup cannot remove exposure data.
 
 The Red Pitaya adapter is isolated in `euv_acquisition.sources.red_pitaya`; it is tested with a fake API locally and must be validated against the STEMlab hardware before authoritative use.
+
+## Siglent observer service
+
+For a local two-source rehearsal, run the authoritative simulator above on
+`11760`/`11761`, then run the Siglent sequence simulator on its dedicated
+`11762`/`11763` ports:
+
+```powershell
+euv-acquisition-siglent-sim `
+	--spool C:\temp\euv-siglent-sim-spool
+```
+
+The defaults match the verified physical geometry: source ID
+`siglent-simulator`, 100 MHz effective sample rate, 1000 points per frame, 250
+frames per sequence, and a 96 Hz trigger cadence. The simulator uses the same
+isolated capture worker, atomic sequence envelopes, TCP protocol, HDF5 schema,
+and historical Siglent native analysis as the physical service. `--seed` makes
+waveform noise repeatable; pulse shape and cadence can be adjusted with
+`--baseline-volts`, `--noise-stddev-volts`, `--amplitude-volts`,
+`--center-seconds`, `--width-seconds`, and `--trigger-rate-hz`.
+
+Run either `euv-acquisition-siglent-sim` or `euv-acquisition-siglent`, not both,
+because they deliberately expose the same service ports.
+
+Install the TCP/IP VISA dependencies in the process-computer environment:
+
+```powershell
+python -m pip install -e ".[siglent]"
+```
+
+Run `euv-acquisition-siglent` on a computer that can reach the scope. The
+service defaults to dedicated control/artifact ports `11762` and `11763` and
+does not open or arm the scope until an observer client starts a capture. Use a
+dedicated spool that is not shared with the authoritative acquisition service.
+
+`--sample-rate-hz` is the effective exported waveform rate. The service
+requests a hardware rate equal to that value multiplied by
+`--waveform-interval`, then validates the returned preamble on every transfer.
+For the IPI SDS2204X HD at its current 1 microsecond/division, 10k-point,
+interval-10 setup, the verified effective geometry is 100 MHz and 1000 points:
+
+```powershell
+euv-acquisition-siglent `
+	--spool C:\ProgramData\IPI\euv-siglent-spool `
+	--visa-resource "TCPIP0::10.11.13.220::5025::SOCKET" `
+	--source-id "SDS2HBAX900425" `
+	--sample-rate-hz 100000000 `
+	--points-per-frame 1000
+```
+
+The source ID is durable identity and must exactly match the companion chamber
+observer command and calibration binding. Confirm the post-configuration
+preamble with one controlled capture before relying on a different scope
+timebase, memory depth, sample rate, or waveform interval.
 
 ## Capture pipeline and telemetry
 
