@@ -1,7 +1,18 @@
 from pathlib import Path
 
 from euv_acquisition.red_pitaya_service import _build_server, _parse_args
+from euv_acquisition.source_identity import RED_PITAYA_SOURCE_ID, RED_PITAYA_SOURCE_KIND
 from euv_acquisition.sources.isolated import IsolatedPulseSource
+
+
+def test_red_pitaya_service_uses_stable_default_source_identity(tmp_path) -> None:
+    args = _parse_args(["--spool", str(tmp_path)])
+
+    server = _build_server(args)
+
+    assert args.source_id == RED_PITAYA_SOURCE_ID
+    assert server.engine.source_kind == RED_PITAYA_SOURCE_KIND
+    assert server.engine.source_id == RED_PITAYA_SOURCE_ID
 
 
 def test_red_pitaya_service_builds_hardware_server_without_opening_source(tmp_path) -> None:
@@ -62,6 +73,7 @@ def test_production_unit_pins_legacy_mode_and_pipeline_capacity_budgets() -> Non
     assert "--persistence-queue-capacity 8" in unit
     assert "--control-queue-capacity 512" in unit
     assert "--pipeline-drain-timeout-seconds 10" in unit
+    assert "--source-id red-pitaya" in unit
     assert "CPUAffinity=0" in unit
     assert "LimitRTPRIO=20" in unit
     assert "RestrictRealtime=no" in unit

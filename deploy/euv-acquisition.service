@@ -11,7 +11,7 @@ Environment="PYTHONUNBUFFERED=1"
 Environment="PYTHONPATH=/opt/euv-acquisition/current/python:/opt/redpitaya/lib/python"
 Environment="LD_LIBRARY_PATH=/opt/euv-acquisition/current/lib"
 Environment="EUV_CAPTURE_MODE=legacy-single-shot"
-ExecStart=/usr/bin/python3 -m euv_acquisition.red_pitaya_service --spool /var/lib/euv-acquisition/spool --host 0.0.0.0 --capture-queue-capacity 32 --capture-cpu 1 --capture-realtime-priority 20 --capture-process-startup-timeout-seconds 5 --capture-process-shutdown-timeout-seconds 2 --persistence-queue-capacity 8 --control-queue-capacity 512 --pipeline-drain-timeout-seconds 10 --log-host 10.11.13.1 --log-port 11751
+ExecStart=/usr/bin/python3 -m euv_acquisition.red_pitaya_service --spool /var/lib/euv-acquisition/spool --host 0.0.0.0 --source-id red-pitaya --capture-queue-capacity 32 --capture-cpu 1 --capture-realtime-priority 20 --capture-process-startup-timeout-seconds 5 --capture-process-shutdown-timeout-seconds 2 --persistence-queue-capacity 8 --control-queue-capacity 512 --pipeline-drain-timeout-seconds 10 --log-host 10.11.13.1 --log-port 11751
 CPUAffinity=0
 LimitRTPRIO=20
 RestrictRealtime=no

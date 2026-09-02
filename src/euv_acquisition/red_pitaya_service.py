@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import os
 import signal
-import socket
 import threading
 import uuid
 from collections.abc import Sequence
@@ -14,6 +13,7 @@ from euv_acquisition.models import CaptureConfig
 from euv_acquisition.service import AcquisitionServer, ServiceConfig
 from euv_acquisition.session import CaptureEngine, RotationConfig, SpoolRepository
 from euv_acquisition.snapshot import SnapshotStore
+from euv_acquisition.source_identity import RED_PITAYA_SOURCE_ID, RED_PITAYA_SOURCE_KIND
 from euv_acquisition.sources.isolated import CaptureProcessConfig, IsolatedPulseSource
 from euv_acquisition.sources.red_pitaya import CaptureMode, RedPitayaPulseSource
 
@@ -34,7 +34,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--persistence-queue-capacity", type=int, default=8)
     parser.add_argument("--control-queue-capacity", type=int, default=512)
     parser.add_argument("--pipeline-drain-timeout-seconds", type=float, default=10.0)
-    parser.add_argument("--source-id", default=socket.gethostname())
+    parser.add_argument("--source-id", default=RED_PITAYA_SOURCE_ID)
     parser.add_argument("--sample-rate-hz", type=float, default=125_000_000.0)
     parser.add_argument("--window-microseconds", type=float, default=10.0)
     parser.add_argument("--pretrigger-microseconds", type=float, default=1.0)
@@ -91,7 +91,7 @@ def _build_server(args: argparse.Namespace, *, logger=None) -> AcquisitionServer
         source,
         snapshot_store,
         spool,
-        source_kind="red_pitaya",
+        source_kind=RED_PITAYA_SOURCE_KIND,
         source_id=args.source_id,
         rotation=RotationConfig(
             pulse_limit=args.snapshot_pulse_limit,
