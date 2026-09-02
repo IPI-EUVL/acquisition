@@ -66,9 +66,10 @@ def _hash_block(payload: bytes) -> bytes:
 
 
 class _FakeScope:
-    def __init__(self, descriptor: bytes, data: bytes) -> None:
+    def __init__(self, descriptor: bytes, data: bytes, *, trigger_states=("STOP",)) -> None:
         self.descriptor = descriptor
         self.data = data
+        self.trigger_states = iter(trigger_states)
         self.commands: list[str] = []
         self.buffer = bytearray()
         self.timeout = None
@@ -81,7 +82,7 @@ class _FakeScope:
         if command == ":ACQ:SRAT?":
             self.buffer.extend(b"2.0E9\n")
         elif command == ":TRIG:STAT?":
-            self.buffer.extend(b"STOP\n")
+            self.buffer.extend(f"{next(self.trigger_states, 'STOP')}\n".encode("ascii"))
         elif command == ":WAVeform:PREamble?":
             self.buffer.extend(_hash_block(self.descriptor))
         elif command == ":WAVeform:DATA?":
@@ -171,6 +172,31 @@ def test_siglent_source_preserves_legacy_float64_integrals_and_transfer_envelope
     assert source.hardware_sample_rate_hz == 2_000_000_000.0
     assert scope.commands.index(":TRIGger:RUN") < scope.commands.index(":WAVeform:DATA?")
     assert scope.commands[-2:] == [":ACQ:SEQuence OFF", ":STOP"]
+    assert scope.closed and manager.closed and source.release_confirmed
+
+
+def test_siglent_source_stops_an_incomplete_sequence_without_reading_it() -> None:
+    descriptor, data, _frame_times = _sequence_fixture(np.zeros((2, 30), dtype=np.int32))
+    scope = _FakeScope(descriptor, data, trigger_states=("READY",))
+    manager = _FakeResourceManager(scope)
+    stop_checks = iter((False, False, True))
+    source = SiglentPulseSource(
+        _capture_config(),
+        resource_name="TCPIP::scope::INSTR",
+        sequence_count=2,
+        resource_manager_factory=lambda: manager,
+        sleep=lambda _seconds: None,
+    )
+    source.set_stop_requested(lambda: next(stop_checks))
+
+    source.open()
+    captured = source.capture()
+    source.close()
+
+    assert captured is None
+    assert ":TRIGger:MODE STOP" in scope.commands
+    assert ":WAVeform:PREamble?" not in scope.commands
+    assert ":WAVeform:DATA?" not in scope.commands
     assert scope.closed and manager.closed and source.release_confirmed
 
 

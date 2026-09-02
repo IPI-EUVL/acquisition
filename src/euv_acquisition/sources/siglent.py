@@ -158,6 +158,7 @@ class SiglentPulseSource:
         self._state = "stopped"
         self._release_confirmed = True
         self._hardware_sample_rate_hz: float | None = None
+        self._stop_requested: Callable[[], bool] = lambda: False
 
     @property
     def capture_config(self) -> CaptureConfig:
@@ -194,6 +195,11 @@ class SiglentPulseSource:
     def set_metrics(self, metrics: PipelineMetrics) -> None:
         self._metrics = metrics
 
+    def set_stop_requested(self, stop_requested: Callable[[], bool]) -> None:
+        if not callable(stop_requested):
+            raise ValueError("Siglent stop-request predicate must be callable.")
+        self._stop_requested = stop_requested
+
     def open(self) -> None:
         if self._state != "stopped" or not self._release_confirmed:
             raise RuntimeError("Siglent pulse source is already open or its previous release failed.")
@@ -210,7 +216,7 @@ class SiglentPulseSource:
             self._close_transport()
             raise
 
-    def capture(self) -> SourceCaptureBatch:
+    def capture(self) -> SourceCaptureBatch | None:
         if self._state != "open" or self._scope is None:
             raise RuntimeError("Siglent pulse source is not open.")
 
@@ -223,7 +229,13 @@ class SiglentPulseSource:
 
         trigger_wait_started_ns = capture_started_monotonic_ns
         while True:
+            if self._stop_requested():
+                self._scope.write(":TRIGger:MODE STOP")
+                return None
             self._sleep(self._trigger_poll_seconds)
+            if self._stop_requested():
+                self._scope.write(":TRIGger:MODE STOP")
+                return None
             self._scope.write(":TRIG:STAT?")
             trigger_state = self._read_line().upper()
             if "STOP" in trigger_state:

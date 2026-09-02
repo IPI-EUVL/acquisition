@@ -187,6 +187,9 @@ def _capture_worker(
         set_metrics = getattr(source, "set_metrics", None)
         if set_metrics is not None:
             set_metrics(metrics)
+        set_stop_requested = getattr(source, "set_stop_requested", None)
+        if set_stop_requested is not None:
+            set_stop_requested(stop_event.is_set)
         phase = "source open"
         source.open()
         status_connection.send(

@@ -1,7 +1,9 @@
+import multiprocessing
 import os
 import queue
 import threading
 import time
+from functools import partial
 from uuid import uuid4
 
 import numpy as np
@@ -111,6 +113,21 @@ class _CloseFailureSource(_ProcessTestSource):
 
     def close(self) -> None:
         raise RuntimeError("release confirmation fixture")
+
+
+class _CooperativeStopSource(_ProcessTestSource):
+    def __init__(self, capture_started) -> None:
+        super().__init__()
+        self._capture_started = capture_started
+        self._stop_requested = lambda: False
+
+    def set_stop_requested(self, stop_requested) -> None:
+        self._stop_requested = stop_requested
+
+    def capture(self) -> None:
+        self._capture_started.set()
+        while not self._stop_requested():
+            time.sleep(0.001)
 
 
 class _BatchProcessTestSource(_ProcessTestSource):
@@ -327,6 +344,25 @@ def test_isolated_source_close_preserves_captured_backlog_for_drain() -> None:
     pulses = source.drain_captured()
 
     assert [pulse.captured_at_unix_ns for pulse in pulses] == list(range(1_000, 1_024))
+
+
+def test_isolated_source_cooperatively_stops_a_blocked_capture() -> None:
+    context = multiprocessing.get_context("spawn")
+    capture_started = context.Event()
+    config = CaptureConfig(sample_rate_hz=1_000_000.0, window_seconds=4e-6, pretrigger_seconds=1e-6)
+    source = IsolatedPulseSource(
+        partial(_CooperativeStopSource, capture_started),
+        config,
+        requested_capture_mode="test-requested",
+        process_config=_process_config(),
+        process_context=context,
+    )
+
+    source.open()
+    assert capture_started.wait(5.0)
+    source.close()
+
+    assert source.state == "stopped"
 
 
 def test_isolated_source_failed_fence_restores_dequeued_pulses() -> None:
