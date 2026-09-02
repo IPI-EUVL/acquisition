@@ -25,7 +25,7 @@ from euv_acquisition.pipeline_metrics import PipelineMetrics
 SIGLENT_NATIVE_ANALYSIS_VERSION = "siglent-native-v1-pre-float32-legacy-trapezoid"
 SIGLENT_CAPTURE_MODE = "siglent-sequence"
 SIGLENT_BATCH_KIND = "siglent_sequence"
-SIGLENT_HARDWARE_SAMPLE_RATE_HZ = 2_000_000_000.0
+SIGLENT_NOMINAL_EXPORTED_SAMPLE_RATE_HZ = 100_000_000.0
 
 
 def analyze_siglent_waveform(
@@ -157,6 +157,7 @@ class SiglentPulseSource:
         self._scope = None
         self._state = "stopped"
         self._release_confirmed = True
+        self._hardware_sample_rate_hz: float | None = None
 
     @property
     def capture_config(self) -> CaptureConfig:
@@ -185,6 +186,10 @@ class SiglentPulseSource:
     @property
     def release_confirmed(self) -> bool:
         return self._release_confirmed
+
+    @property
+    def hardware_sample_rate_hz(self) -> float | None:
+        return self._hardware_sample_rate_hz
 
     def set_metrics(self, metrics: PipelineMetrics) -> None:
         self._metrics = metrics
@@ -309,13 +314,6 @@ class SiglentPulseSource:
             raise ValueError("Siglent preamble frame count does not match the configured sequence count.")
 
         effective_interval = metadata["interval"] * self._waveform_interval
-        if not math.isclose(
-            effective_interval,
-            self._capture_config.sample_interval_seconds,
-            rel_tol=1e-6,
-            abs_tol=0.0,
-        ):
-            raise ValueError("Siglent preamble sample interval does not match the configured sample rate.")
 
         width = metadata["width"]
         expected_bytes = exported_points * read_frames * (1 if width == 0 else 2)
@@ -345,12 +343,7 @@ class SiglentPulseSource:
         if not np.isfinite(waveforms).all():
             raise ValueError("Siglent decoded waveforms contain non-finite values.")
 
-        time_axis = np.linspace(
-            0,
-            metadata["interval"] * exported_points * self.HORI_NUM,
-            exported_points,
-            endpoint=False,
-        )
+        time_axis = np.arange(exported_points, dtype=np.float64) * effective_interval
         frame_unix_ns = self._epochs_ns_from_preamble(descriptor, read_frames)
         if any(current <= previous for previous, current in zip(frame_unix_ns, frame_unix_ns[1:])):
             raise ValueError("Siglent frame timestamps must increase.")
@@ -363,13 +356,16 @@ class SiglentPulseSource:
             ":WAV:WIDT WORD; :WAV:FORM WORD",
             f":WAVeform:INTerval {self._waveform_interval}",
             ":ACQ:TYPE NORM",
-            ":ACQ:MMAN FSRate",
-            f":ACQ:SRAT {SIGLENT_HARDWARE_SAMPLE_RATE_HZ:.12g}",
             ":CHAN1:DISP ON; :WAV:SOUR C1",
             ":HISTory ON",
-            ":RUN",
         ):
             self._scope.write(command)
+        self._scope.write(":ACQ:SRAT?")
+        sample_rate_hz = float(self._read_line())
+        if not math.isfinite(sample_rate_hz) or sample_rate_hz <= 0:
+            raise ValueError("Siglent reported an invalid hardware sample rate.")
+        self._hardware_sample_rate_hz = sample_rate_hz
+        self._scope.write(":RUN")
 
     def _parse_sequence_preamble(self, descriptor: bytes) -> dict[str, int | float]:
         if len(descriptor) < 0x14C:

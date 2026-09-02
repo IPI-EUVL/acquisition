@@ -14,7 +14,11 @@ from euv_acquisition.service import AcquisitionServer, ServiceConfig
 from euv_acquisition.session import CaptureEngine, RotationConfig, SpoolRepository
 from euv_acquisition.snapshot import SnapshotStore
 from euv_acquisition.sources.isolated import CaptureProcessConfig, IsolatedPulseSource
-from euv_acquisition.sources.siglent import SIGLENT_CAPTURE_MODE, SiglentPulseSource
+from euv_acquisition.sources.siglent import (
+    SIGLENT_CAPTURE_MODE,
+    SIGLENT_NOMINAL_EXPORTED_SAMPLE_RATE_HZ,
+    SiglentPulseSource,
+)
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -22,12 +26,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--spool", required=True, help="Dedicated local Siglent HDF5 spool directory.")
     parser.add_argument("--visa-resource", required=True, help="PyVISA resource for the Siglent oscilloscope.")
     parser.add_argument("--source-id", required=True, help="Stable identity for this physical oscilloscope.")
-    parser.add_argument(
-        "--sample-rate-hz",
-        type=float,
-        default=100_000_000.0,
-        help="Expected effective exported sample rate (default: 100 MHz).",
-    )
     parser.add_argument(
         "--points-per-frame",
         type=int,
@@ -61,9 +59,9 @@ def _build_server(args: argparse.Namespace, *, logger=None) -> AcquisitionServer
     if args.points_per_frame <= 25:
         raise ValueError("Siglent points per frame must exceed the 25-sample baseline window.")
     capture_config = CaptureConfig(
-        sample_rate_hz=args.sample_rate_hz,
-        window_seconds=args.points_per_frame / args.sample_rate_hz,
-        pretrigger_seconds=25 / args.sample_rate_hz,
+        sample_rate_hz=SIGLENT_NOMINAL_EXPORTED_SAMPLE_RATE_HZ,
+        window_seconds=args.points_per_frame / SIGLENT_NOMINAL_EXPORTED_SAMPLE_RATE_HZ,
+        pretrigger_seconds=25 / SIGLENT_NOMINAL_EXPORTED_SAMPLE_RATE_HZ,
         input_full_scale_volts=args.input_full_scale_volts,
         clipping_fraction=args.clipping_fraction,
     )

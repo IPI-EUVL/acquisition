@@ -78,7 +78,9 @@ class _FakeScope:
 
     def write(self, command: str) -> None:
         self.commands.append(command)
-        if command == ":TRIG:STAT?":
+        if command == ":ACQ:SRAT?":
+            self.buffer.extend(b"2.0E9\n")
+        elif command == ":TRIG:STAT?":
             self.buffer.extend(b"STOP\n")
         elif command == ":WAVeform:PREamble?":
             self.buffer.extend(_hash_block(self.descriptor))
@@ -163,7 +165,10 @@ def test_siglent_source_preserves_legacy_float64_integrals_and_transfer_envelope
     assert analyze_pulse(batch.pulses[0].samples_v, config).integral_volt_seconds.hex() != expected_integral.hex()
 
     assert manager.resource_name == "TCPIP::scope::INSTR"
-    assert ":ACQ:SRAT 2000000000" in scope.commands
+    assert ":ACQ:SRAT?" in scope.commands
+    assert not any(command.startswith(":ACQ:SRAT ") for command in scope.commands)
+    assert ":ACQ:MMAN FSRate" not in scope.commands
+    assert source.hardware_sample_rate_hz == 2_000_000_000.0
     assert scope.commands.index(":TRIGger:RUN") < scope.commands.index(":WAVeform:DATA?")
     assert scope.commands[-2:] == [":ACQ:SEQuence OFF", ":STOP"]
     assert scope.closed and manager.closed and source.release_confirmed
@@ -179,6 +184,22 @@ def test_siglent_decoder_rejects_unexpected_exported_shape() -> None:
 
     with pytest.raises(ValueError, match="exported point count"):
         source.decode_sequence_waveforms(descriptor, data)
+
+
+def test_siglent_decoder_uses_the_actual_preamble_sample_interval() -> None:
+    descriptor, data, _frame_times = _sequence_fixture(
+        np.zeros((2, 30), dtype=np.int32),
+        sample_rate_hz=2_000_000.0,
+    )
+    source = SiglentPulseSource(
+        _capture_config(),
+        resource_name="TCPIP::scope::INSTR",
+        sequence_count=2,
+    )
+
+    time_axis, _waveforms, _timestamps = source.decode_sequence_waveforms(descriptor, data)
+
+    assert time_axis[1] == pytest.approx(0.5e-6)
 
 
 def test_siglent_source_requires_exactly_25_pretrigger_samples() -> None:
