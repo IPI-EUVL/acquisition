@@ -242,8 +242,10 @@ class AcquisitionServer:
                     self._send_control(heartbeat_message())
                     continue
                 request_id, command, payload = validate_command_message(message)
+                command_log_level = "DEBUG" if command == "status" else "INFO"
                 self._log(
                     f"Received control command {command} ({request_id}).",
+                    level=command_log_level,
                     event="control_command_received",
                     command=command,
                     request_id=str(request_id),
@@ -265,6 +267,7 @@ class AcquisitionServer:
                 else:
                     self._log(
                         f"Control command {command} ({request_id}) completed.",
+                        level=command_log_level,
                         event="control_command_completed",
                         command=command,
                         request_id=str(request_id),
@@ -577,6 +580,7 @@ class AcquisitionServer:
         snapshot = self.engine.metrics.snapshot()
         self._log(
             f"Pipeline metrics: state={snapshot['state']}, counters={snapshot['counters']}.",
+            level="DEBUG" if event == "pipeline_metrics_summary" else "INFO",
             event=event,
             pipeline_metrics=snapshot,
         )
@@ -650,7 +654,8 @@ class AcquisitionServer:
                 )
 
     def _log(self, message: str, *, level: str = "INFO", event: str | None = None, **data: Any) -> None:
-        print(f"[EUV Acquisition Service] {message}", flush=True)
+        if level != "DEBUG":
+            print(f"[EUV Acquisition Service] {message}", flush=True)
         if self._logger is not None:
             self._logger.log(
                 message,

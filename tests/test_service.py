@@ -335,6 +335,33 @@ def test_service_logs_control_command_lifecycle(tmp_path) -> None:
     assert "control_command_completed" in events
 
 
+def test_service_logs_routine_status_and_metric_summaries_at_debug(tmp_path) -> None:
+    logger = _Logger()
+    server = _server(tmp_path, timestamps=(), logger=logger)
+    client = AcquisitionClient(server.control_address, server.artifact_address)
+    client.connect()
+    try:
+        client.command("status")
+        server._log_pipeline_metrics(event="pipeline_metrics_summary")
+    finally:
+        client.close()
+        server.close()
+
+    status_records = [
+        record
+        for record in logger.records
+        if record[1].get("command") == "status"
+    ]
+    assert len(status_records) == 2
+    assert all(record[1]["level"] == "DEBUG" for record in status_records)
+    metric_record = next(
+        record
+        for record in logger.records
+        if record[1].get("event") == "pipeline_metrics_summary"
+    )
+    assert metric_record[1]["level"] == "DEBUG"
+
+
 def test_service_reports_capabilities_and_defaults_capture_to_experiment(tmp_path) -> None:
     server = _server(tmp_path, timestamps=())
     client = AcquisitionClient(server.control_address, server.artifact_address)
