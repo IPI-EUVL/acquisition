@@ -22,8 +22,18 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--spool", required=True, help="Dedicated local Siglent HDF5 spool directory.")
     parser.add_argument("--visa-resource", required=True, help="PyVISA resource for the Siglent oscilloscope.")
     parser.add_argument("--source-id", required=True, help="Stable identity for this physical oscilloscope.")
-    parser.add_argument("--sample-rate-hz", required=True, type=float, help="Expected effective exported sample rate.")
-    parser.add_argument("--points-per-frame", required=True, type=int, help="Expected exported points per frame.")
+    parser.add_argument(
+        "--sample-rate-hz",
+        type=float,
+        default=100_000_000.0,
+        help="Expected effective exported sample rate (default: 100 MHz).",
+    )
+    parser.add_argument(
+        "--points-per-frame",
+        type=int,
+        default=1000,
+        help="Expected exported points per frame (default: 1000).",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--control-port", type=int, default=11762)
     parser.add_argument("--artifact-port", type=int, default=11763)

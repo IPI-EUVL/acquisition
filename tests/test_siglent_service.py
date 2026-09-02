@@ -12,10 +12,6 @@ def test_siglent_service_builds_isolated_windows_server_without_opening_visa(tmp
             "TCPIP0::10.11.13.220::5025::SOCKET",
             "--source-id",
             "siglent-test",
-            "--sample-rate-hz",
-            "200000000",
-            "--points-per-frame",
-            "2000",
             "--capture-queue-capacity",
             "3",
         ]
@@ -25,8 +21,8 @@ def test_siglent_service_builds_isolated_windows_server_without_opening_visa(tmp
 
     assert isinstance(server.engine.source, IsolatedPulseSource)
     assert server.engine.source.state == "stopped"
-    assert server.engine.source.capture_config.sample_rate_hz == 200_000_000.0
-    assert server.engine.source.capture_config.window_samples == 2000
+    assert server.engine.source.capture_config.sample_rate_hz == 100_000_000.0
+    assert server.engine.source.capture_config.window_samples == 1000
     assert server.engine.source.capture_config.pretrigger_samples == 25
     assert server.engine.source.process_config.cpu is None
     assert server.engine.source.process_config.realtime_priority is None

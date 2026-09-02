@@ -163,7 +163,7 @@ def test_siglent_source_preserves_legacy_float64_integrals_and_transfer_envelope
     assert analyze_pulse(batch.pulses[0].samples_v, config).integral_volt_seconds.hex() != expected_integral.hex()
 
     assert manager.resource_name == "TCPIP::scope::INSTR"
-    assert ":ACQ:SRAT 10000000" in scope.commands
+    assert ":ACQ:SRAT 2000000000" in scope.commands
     assert scope.commands.index(":TRIGger:RUN") < scope.commands.index(":WAVeform:DATA?")
     assert scope.commands[-2:] == [":ACQ:SEQuence OFF", ":STOP"]
     assert scope.closed and manager.closed and source.release_confirmed

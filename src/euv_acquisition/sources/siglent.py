@@ -25,6 +25,7 @@ from euv_acquisition.pipeline_metrics import PipelineMetrics
 SIGLENT_NATIVE_ANALYSIS_VERSION = "siglent-native-v1-pre-float32-legacy-trapezoid"
 SIGLENT_CAPTURE_MODE = "siglent-sequence"
 SIGLENT_BATCH_KIND = "siglent_sequence"
+SIGLENT_HARDWARE_SAMPLE_RATE_HZ = 2_000_000_000.0
 
 
 def analyze_siglent_waveform(
@@ -356,7 +357,6 @@ class SiglentPulseSource:
         return time_axis, waveforms, frame_unix_ns
 
     def _configure(self) -> None:
-        hardware_sample_rate_hz = self._capture_config.sample_rate_hz * self._waveform_interval
         for command in (
             ":STOP",
             ":WAVeform:WIDTh BYTE",
@@ -364,7 +364,7 @@ class SiglentPulseSource:
             f":WAVeform:INTerval {self._waveform_interval}",
             ":ACQ:TYPE NORM",
             ":ACQ:MMAN FSRate",
-            f":ACQ:SRAT {hardware_sample_rate_hz:.12g}",
+            f":ACQ:SRAT {SIGLENT_HARDWARE_SAMPLE_RATE_HZ:.12g}",
             ":CHAN1:DISP ON; :WAV:SOUR C1",
             ":HISTory ON",
             ":RUN",
